@@ -1,0 +1,251 @@
+#!/usr/bin/env python3
+"""Is a candidate bot stronger than a baseline? A sequential probability ratio test on game pairs.
+
+Each opening (map, seed) is played twice with the sides swapped, so map and side advantages cancel. Pairs are
+played until the log likelihood ratio crosses a bound or --max-pairs is reached. Games already played (same code,
+same map, same seed) come from the cache in .fish/games and are not replayed.
+
+  tools/sprt                          the working tree's bot against HEAD
+  tools/sprt my-branch                a branch against HEAD
+  tools/sprt my-branch --base v3      against another ref, or a folder of compiled classes
+  tools/sprt --maps rift,DefaultSmall --elo1 20 --workers 8
+
+  tools/sprt my-branch --ref research --base jan29     paired: my-branch against research, both playing jan29
+
+With --ref, the candidate and the reference both play the base on the same openings and the test is on the
+difference of their pair scores per opening (pentanomial GSPRT). Openings both bots play alike cancel, so a decision
+takes several times fewer games, and the reference's own edge over the base drops out. Its games come from the
+cache when played before. elo0/elo1 are then Elo of the candidate over the reference, measured against the base
+(default 0 and 5).
+
+Openings are scored in the order they were sent out, only up to the first one not yet complete, so the verdict
+depends on the code and the openings, never on which game finished first.
+
+Exit: 0 stronger, 1 not stronger, 2 undecided, 3 broken (an engine error in any game, or bot exceptions with
+--strict) or could not run.
+"""
+import argparse
+import random
+import sys
+import time
+from collections import defaultdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+from sprtmath import (MIN_PAIRS, bounds, elo, elo_interval, llr, paired_hypotheses, paired_interval,  # noqa: E402
+                      penta_llr)
+
+
+def openings(maps, seed_base):
+    """Deterministic order: all maps at one seed (shuffled), then the next seed. Reruns hit the cache."""
+    s = seed_base
+    while True:
+        block = list(maps)
+        random.Random(s).shuffle(block)
+        for m in block:
+            yield m, s
+        s += 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("candidate", nargs="?", default="wt", help="'wt' (working tree), a git ref, or a classes folder")
+    ap.add_argument("--base", default="HEAD", help="the opponent (with --ref) or the baseline")
+    ap.add_argument("--ref", help="paired mode: the reference the candidate is compared with, both against --base")
+    ap.add_argument("--maps", default="pool", help="names, folders, or pool/gen/all (default: pool)")
+    ap.add_argument("--elo0", type=float, default=None, help="default 0")
+    ap.add_argument("--elo1", type=float, default=None, help="default 10, or 5 with --ref")
+    ap.add_argument("--alpha", type=float, default=0.05)
+    ap.add_argument("--beta", type=float, default=0.05)
+    ap.add_argument("--max-pairs", type=int, default=3000, help="openings at most")
+    ap.add_argument("--seed", type=int, default=1, help="first opening seed")
+    ap.add_argument("--workers", type=int, default=F.default_workers())
+    ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--strict", action="store_true", help="bot exceptions count as broken")
+    ap.add_argument("--xray", nargs="?", const="all", choices=["all", "robots", "map", "team"],
+                    help="oracle: the candidate's rats sense a full circle (what perfect vision is worth); "
+                         "'robots' or 'map' for only robots or only the map, 'team' for "
+                         "robots that any allied rat sees")
+    args = ap.parse_args()
+    paired = args.ref is not None
+    elo0 = 0.0 if args.elo0 is None else args.elo0
+    elo1 = (5.0 if paired else 10.0) if args.elo1 is None else args.elo1
+
+    F.build_engine()
+    cand, base = F.build_bot(args.candidate), F.build_bot(args.base)
+    ref = F.build_bot(args.ref) if paired else None
+    if not paired and cand.key == base.key and not args.xray:
+        print(f"candidate and base are the same code ({cand.key})")
+    if paired and cand.key == ref.key and not args.xray:
+        print(f"candidate and reference are the same code ({cand.key})")
+    maps = F.resolve_maps(args.maps)
+    lo, hi = bounds(args.alpha, args.beta)
+    what = (f"{args.candidate} ({cand.key}) vs {args.ref} ({ref.key}), both against {args.base} ({base.key})"
+            if paired else f"{args.candidate} ({cand.key}) vs {args.base} ({base.key})")
+    print(f"sprt {what}: elo [{elo0:g}, {elo1:g}], alpha {args.alpha:g}, beta {args.beta:g}, {len(maps)} maps, "
+          f"{args.workers} workers", flush=True)
+
+    cache = F.GameCache(not args.no_cache)
+    pool = None
+    roles = ("c", "r") if paired else ("c",)
+    ops = []  # openings in the order they were sent out
+    got = []  # per opening: {(role, cand_is_a): won}
+    scored = 0  # openings scored: always a complete prefix of ops
+    pairs = [0, 0, 0]  # old mode: pairs the candidate won 0, 1, 2 games of
+    penta = [0, 0, 0, 0, 0]  # paired mode: openings by d = -1 .. +1
+    ref_wins = cand_wins = 0  # paired mode: games won over the scored prefix
+    flips = [0, 0]  # paired mode: games lost->won and won->lost against the reference's game in that seat
+    per_map = defaultdict(lambda: [0, 0])  # candidate wins, games (scored prefix)
+    errors, exceptions = [], [0, 0, 0]  # candidate, base, reference
+    played = cached = 0
+    start = time.monotonic()
+    verdict = None
+    gen = openings(maps, args.seed)
+    in_flight = 0
+
+    def finish(g):
+        r = g.result
+        idx, role, seat_a = g.tag
+        if "error" in r:
+            op = ops[idx]
+            errors.append(f"{op[0].stem} seed {op[1]}: {r['error']}")
+            return
+        exc = r.get("exceptions", [0, 0])
+        mine, theirs = (exc[0], exc[1]) if seat_a else (exc[1], exc[0])
+        exceptions[0 if role == "c" else 2] += mine
+        exceptions[1] += theirs
+        got[idx][(role, seat_a)] = r.get("winner") == ("A" if seat_a else "B")
+
+    def advance():
+        """Scores complete openings in order, one at a time, and returns the verdict as soon as the prefix has one
+        (so it is the same whatever order games finish in, and with or without the cache)."""
+        nonlocal scored, ref_wins, cand_wins
+        while scored < len(ops) and len(got[scored]) == 2 * len(roles):
+            res, op = got[scored], ops[scored]
+            c = res[("c", True)] + res[("c", False)]
+            per_map[op[0].stem][0] += c
+            per_map[op[0].stem][1] += 2
+            if paired:
+                rw = res[("r", True)] + res[("r", False)]
+                penta[c - rw + 2] += 1
+                cand_wins += c
+                ref_wins += rw
+                for seat in (True, False):
+                    if res[("c", seat)] != res[("r", seat)]:
+                        flips[0 if res[("c", seat)] else 1] += 1
+            else:
+                pairs[c] += 1
+            got[scored] = None
+            scored += 1
+            v = decide()
+            if v is not None:
+                return v
+        return None
+
+    def ref_score():
+        return ref_wins / max(1, 2 * scored)
+
+    def ratio():
+        if paired:
+            return penta_llr(penta, *paired_hypotheses(ref_score(), elo0, elo1))
+        return llr(pairs, elo0, elo1)
+
+    def report():
+        rate = played / max(1e-9, time.monotonic() - start)
+        if paired:
+            d, dlo, dhi, e, elo_lo, elo_hi = paired_interval(penta, ref_score())
+            rs = ref_score()
+            line = (f"pairs {scored:5d} {penta}  diff {100 * d:+.2f} pp [{100 * dlo:+.2f}, {100 * dhi:+.2f}]  "
+                    f"elo {e:+6.1f} [{elo_lo:+.1f}, {elo_hi:+.1f}] (vs base: ref {elo(rs) if scored else 0:+.1f}, "
+                    f"cand {elo(rs + d) if scored else 0:+.1f})  flips +{flips[0]} -{flips[1]}  "
+                    f"llr {ratio():+.2f} [{lo:.2f}, {hi:.2f}]  {rate:.2f} games/s")
+        else:
+            e, elo_lo, elo_hi = elo_interval(pairs)
+            line = (f"pairs {scored:5d} [{pairs[0]} {pairs[1]} {pairs[2]}]  elo {e:+6.1f} [{elo_lo:+.1f}, "
+                    f"{elo_hi:+.1f}]  llr {ratio():+.2f} [{lo:.2f}, {hi:.2f}]  {rate:.2f} games/s")
+        print(line, flush=True)
+
+    def decide():
+        if scored < min(MIN_PAIRS, args.max_pairs):
+            return None
+        x = ratio()
+        if x >= hi:
+            return 0
+        if x <= lo:
+            return 1
+        if scored >= args.max_pairs:
+            return 2
+        return None
+
+    try:
+        while verdict is None:
+            # Keep every worker busy; an opening's games go out together.
+            while len(ops) < args.max_pairs and in_flight < 2 * args.workers + 2 and not errors:
+                op = next(gen)
+                idx = len(ops)
+                ops.append(op)
+                got.append({})
+                for role in roles:
+                    bot = cand if role == "c" else ref
+                    for seat_a in (True, False):
+                        a, b = (bot, base) if seat_a else (base, bot)
+                        xray = ""
+                        if args.xray and role == "c":
+                            xray = ("A" if seat_a else "B") + ("" if args.xray == "all" else ":" + args.xray)
+                        g = F.Game(op[0], op[1], a, b, tag=(idx, role, seat_a), xray=xray)
+                        hit = cache.get(g)
+                        if hit is not None:
+                            g.result = hit
+                            cached += 1
+                            finish(g)
+                            continue
+                        if pool is None:
+                            pool = F.WorkerPool(args.workers)
+                        pool.submit(g)
+                        in_flight += 1
+                verdict = advance()
+                if verdict is not None:
+                    break
+            if errors or verdict is not None:
+                break
+            if in_flight == 0:
+                verdict = 2  # nothing left to play (every opening scored)
+                break
+            g = pool.results.get()
+            in_flight -= 1
+            played += 1
+            cache.put(g, g.result)
+            finish(g)
+            verdict = advance()
+            if verdict is None and played % max(1, args.workers) == 0:
+                report()
+    except KeyboardInterrupt:
+        print("interrupted", flush=True)
+        verdict = 2
+    finally:
+        if pool is not None:
+            pool.close()
+
+    report()
+    print(f"games played {played}, from cache {cached}, {time.monotonic() - start:.0f}s"
+          + (f"; openings scored {scored} of {len(ops)} sent" if scored < len(ops) else ""))
+    if any(exceptions):
+        print(f"uncaught bot exceptions: candidate {exceptions[0]}, base {exceptions[1]}"
+              + (f", reference {exceptions[2]}" if paired else ""))
+    worst = sorted(((w / n, m, w, n) for m, (w, n) in per_map.items() if n), key=lambda t: t[0])
+    if worst:
+        print("weakest maps:  " + ", ".join(f"{m} {w}/{n}" for _, m, w, n in worst[:6]))
+        print("strongest maps: " + ", ".join(f"{m} {w}/{n}" for _, m, w, n in worst[::-1][:6]))
+    if errors:
+        print(f"BROKEN: {len(errors)} game(s) failed, first: {errors[0]}")
+        return 3
+    if args.strict and exceptions[0]:
+        print("BROKEN: the candidate threw uncaught exceptions")
+        return 3
+    print({0: "STRONGER", 1: "NOT STRONGER", 2: "UNDECIDED"}[verdict])
+    return verdict
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,191 @@
+{% macro java_char_literal(code) -%}
+{%- if code == 10 -%}'\n'
+{%- elif code == 13 -%}'\r'
+{%- elif code == 9 -%}'\t'
+{%- elif code == 8 -%}'\b'
+{%- elif code == 12 -%}'\f'
+{%- elif code == 39 -%}'\''          {# single quote #}
+{%- elif code == 92 -%}'\\'          {# backslash #}
+{%- else -%}(char)0x{{ "%04X"|format(code) }}
+{%- endif -%}
+{%- endmacro %}
+
+
+{% macro java_string_char(code) -%}
+{%- if code == 10 -%}\n
+{%- elif code == 13 -%}\r
+{%- elif code == 9 -%}\t
+{%- elif code == 8 -%}\b
+{%- elif code == 12 -%}\f
+{%- else -%}\u{{ "%04X"|format(code) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro get_team_ordinal(team) -%}
+{%- if team == 'A' -%}0
+{%- elif team == 'B' -%}1
+{%- else -%}2
+{%- endif -%}
+{%- endmacro %}
+
+package awubot;
+
+import awubot.util.string.FastMapLocationSet;
+import awubot.comms.GlobalArray;
+import battlecode.common.*;
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import awubot.util.Profiler;
+
+{%- set OFF = 0x0FFF -%}
+{%- set MAX_DIST = 42 -%}
+
+public class RobotTracker {
+
+    private static StringBuilder baseString = new StringBuilder("{% for c in range(0, MAX_DIST + 1) %}{{ java_string_char(OFF + c) }}{% endfor %}");
+    public static RobotInfo[] sortedRobots = new RobotInfo[25];
+    public static RobotInfo[] sortedEnemies = new RobotInfo[25];
+    public static RobotInfo[] sortedAllies = new RobotInfo[25];
+    public static RobotInfo[] sortedCats = new RobotInfo[10];
+    public static int numRobots, numEnemies, numAllies, numCats;
+    private static char DELIM_CHAR = '\u0FFF';
+    private static String DELIM_STRING = "\u0FFF";
+
+    public static void init() {
+    }
+
+    public static void preTick() {
+        // println("preTick");
+        updateRobots();
+    }
+
+    public static void updateRobots() {
+        if (team == Team.A) {
+            updateRobotsA();
+        } else {
+            updateRobotsB();
+        }
+    }
+
+    {% for myTeam in ['A', 'B'] %}
+    {% set enemy = 'B' if myTeam == 'A' else 'A' %}
+    public static void updateRobots{{myTeam}}() {
+        // kind of a hack job
+        allyCount = 0;
+        allySet = new FastMapLocationSet();
+        kingSet = new FastMapLocationSet();
+
+        // // Profiler.begin();
+        StringBuilder sb = new StringBuilder(baseString);
+        RobotInfo[] nearbyRobots = rc.senseNearbyRobots();
+        numRobots = nearbyRobots.length;
+        numEnemies = numAllies = numCats = 0;
+        switch (numRobots) {
+            {% for count in range(MAX_DIST, -1, -1) %}
+            case {{count + 1}}: {
+                int d = nearbyRobots[{{count}}].location.distanceSquaredTo(myLoc);
+                {# assert(d <= {{MAX_DIST}}) : "Robot at distance " + d + " >= MAX_DIST {{MAX_DIST}}" + " location " + nearbyRobots[{{count}}].location + " my loc " + myLoc; #}
+                int j = sb.indexOf(String.valueOf((char) ({{OFF}} + d)));
+                sb.insert(j, {{ java_char_literal(count) }});
+                switch (nearbyRobots[{{count}}].team.ordinal()) {
+                    case {{get_team_ordinal('NEUTRAL')}}:
+                        numCats++;
+                        break;
+                    case {{get_team_ordinal(myTeam)}}:
+                        numAllies++;
+                        break;
+                    case {{get_team_ordinal(enemy)}}:
+                        numEnemies++;
+                        break;
+                }
+            }
+                {% endfor %}
+            case 0:
+                break;
+            default:
+                assert(false);
+                break;
+        }
+        int i;
+        {% for i in range(0, MAX_DIST + 1) %}
+        sb.deleteCharAt(sb.indexOf("{{ java_string_char(OFF + i) }}"));
+        {% endfor %}
+
+        int nextAlly = numAllies;
+        int nextEnemy = numEnemies;
+        int nextCat = numCats;
+        switch (numRobots) {
+            {% for count in range(MAX_DIST, -1, -1) %}
+            case {{count + 1}}: {
+                sortedRobots[{{count}}] =  nearbyRobots[(int) sb.charAt({{count}})];
+                switch (sortedRobots[{{count}}].team.ordinal()) {
+                    case {{get_team_ordinal('NEUTRAL')}}:
+                        sortedCats[--nextCat] = sortedRobots[{{count}}];
+                        break;
+                    case {{get_team_ordinal(myTeam)}}:
+                        sortedAllies[--nextAlly] = sortedRobots[{{count}}];
+                        break;
+                    case {{get_team_ordinal(enemy)}}:
+                        sortedEnemies[--nextEnemy] = sortedRobots[{{count}}];
+                        break;
+                }
+            }
+                {% endfor %}
+            case 0:
+                break;
+            default:
+                assert(false);
+                break;
+        }
+        // // Profiler.end_print("updateRobots");
+    }
+    {% endfor %}
+
+    public static RobotInfo[][] catHist = new RobotInfo[4][10];
+    public static int[] catHistNum = new int[4];
+    public static void updateHistoricalCatLocs() throws GameActionException {
+        for(int i = 0; i < numCats; i++) {
+            catHist[time % 4][i] = sortedCats[i];
+        }
+        catHistNum[time % 4] = numCats;
+    }
+
+    public static int allyCount = 0;
+    public static MapLocation[] allies = new MapLocation[120];
+    public static FastMapLocationSet allySet, kingSet;
+    public static void addAlly(MapLocation loc) {
+        if(!allySet.contains(loc)) {
+            allies[allyCount++] = loc;
+            allySet.add(loc);
+        }
+    }
+
+    // IF TLE: optimise this
+    public static void reset() throws GameActionException {
+        for(var robot : rc.senseNearbyRobots(-1, team)) {
+            if(robot.type == UnitType.BABY_RAT) {
+                addAlly(robot.location);
+            }
+        }
+        {% for i in range(5) %}
+        {
+            var kingLoc = GlobalArray.getRatKing({{i}});
+            if(kingLoc != null) {
+                if(GlobalArray.isKingExpanded({{i}})) {
+                    {% for dx in range(-2, 3) %}
+                    {% for dy in range(-2, 3) %}
+                    kingSet.add(kingLoc.translate({{dx}}, {{dy}}));
+                    {% endfor %}
+                    {% endfor %}
+                } else {
+                    {% for dx in range(-1, 2) %}
+                    {% for dy in range(-1, 2) %}
+                    kingSet.add(kingLoc.translate({{dx}}, {{dy}}));
+                    {% endfor %}
+                    {% endfor %}
+                }
+            }
+        }
+        {% endfor %}
+    }
+}

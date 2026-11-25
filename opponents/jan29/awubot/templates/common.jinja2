@@ -1,0 +1,125 @@
+{# Global Jinja helpers. Shared macros/snippets live here. #}
+
+{# Direction maps #}
+{% set related_map = {
+    0: ["Direction.NORTH", "Direction.NORTHEAST", "Direction.NORTHWEST"],
+    1: ["Direction.NORTHEAST", "Direction.NORTH", "Direction.EAST"],
+    2: ["Direction.EAST", "Direction.NORTHEAST", "Direction.SOUTHEAST"],
+    3: ["Direction.SOUTHEAST", "Direction.SOUTH", "Direction.EAST"],
+    4: ["Direction.SOUTH", "Direction.SOUTHEAST", "Direction.SOUTHWEST"],
+    5: ["Direction.SOUTHWEST", "Direction.SOUTH", "Direction.WEST"],
+    6: ["Direction.WEST", "Direction.NORTHWEST", "Direction.SOUTHWEST"],
+    7: ["Direction.NORTHWEST", "Direction.NORTH", "Direction.WEST"],
+} %}
+{% set wide_related_map = {
+    0: ["Direction.NORTH", "Direction.NORTHEAST", "Direction.NORTHWEST", "Direction.EAST", "Direction.WEST"],
+    1: ["Direction.NORTHEAST", "Direction.NORTH", "Direction.EAST", "Direction.NORTHWEST", "Direction.SOUTHEAST"],
+    2: ["Direction.EAST", "Direction.NORTHEAST", "Direction.SOUTHEAST", "Direction.NORTH", "Direction.SOUTH"],
+    3: ["Direction.SOUTHEAST", "Direction.SOUTH", "Direction.EAST", "Direction.NORTHEAST", "Direction.SOUTHWEST"],
+    4: ["Direction.SOUTH", "Direction.SOUTHEAST", "Direction.SOUTHWEST", "Direction.EAST", "Direction.WEST"],
+    5: ["Direction.SOUTHWEST", "Direction.SOUTH", "Direction.WEST", "Direction.NORTHWEST", "Direction.SOUTHEAST"],
+    6: ["Direction.WEST", "Direction.NORTHWEST", "Direction.SOUTHWEST", "Direction.NORTH", "Direction.SOUTH"],
+    7: ["Direction.NORTHWEST", "Direction.NORTH", "Direction.WEST", "Direction.NORTHEAST", "Direction.SOUTHWEST"],
+} %}
+{% set wide_related_map_center = {
+    0: ["Direction.CENTER", "Direction.NORTH", "Direction.NORTHEAST", "Direction.NORTHWEST", "Direction.EAST", "Direction.WEST"],
+    1: ["Direction.CENTER", "Direction.NORTHEAST", "Direction.NORTH", "Direction.EAST", "Direction.NORTHWEST", "Direction.SOUTHEAST"],
+    2: ["Direction.CENTER", "Direction.EAST", "Direction.NORTHEAST", "Direction.SOUTHEAST", "Direction.NORTH", "Direction.SOUTH"],
+    3: ["Direction.CENTER", "Direction.SOUTHEAST", "Direction.SOUTH", "Direction.EAST", "Direction.NORTHEAST", "Direction.SOUTHWEST"],
+    4: ["Direction.CENTER", "Direction.SOUTH", "Direction.SOUTHEAST", "Direction.SOUTHWEST", "Direction.EAST", "Direction.WEST"],
+    5: ["Direction.CENTER", "Direction.SOUTHWEST", "Direction.SOUTH", "Direction.WEST", "Direction.NORTHWEST", "Direction.SOUTHEAST"],
+    6: ["Direction.CENTER", "Direction.WEST", "Direction.NORTHWEST", "Direction.SOUTHWEST", "Direction.NORTH", "Direction.SOUTH"],
+    7: ["Direction.CENTER", "Direction.NORTHWEST", "Direction.NORTH", "Direction.WEST", "Direction.NORTHEAST", "Direction.SOUTHWEST"],
+} %}
+{% set dir_short_map = {
+    "Direction.NORTH": "N",
+    "Direction.NORTHEAST": "NE",
+    "Direction.EAST": "E",
+    "Direction.SOUTHEAST": "SE",
+    "Direction.SOUTH": "S",
+    "Direction.SOUTHWEST": "SW",
+    "Direction.WEST": "W",
+    "Direction.NORTHWEST": "NW",
+    "Direction.CENTER": "C",
+} %}
+{% set dir_ord_map = {
+    "Direction.NORTH": 0,
+    "Direction.NORTHEAST": 1,
+    "Direction.EAST": 2,
+    "Direction.SOUTHEAST": 3,
+    "Direction.SOUTH": 4,
+    "Direction.SOUTHWEST": 5,
+    "Direction.WEST": 6,
+    "Direction.NORTHWEST": 7,
+    "Direction.CENTER": 8,
+} %}
+{% set dir_opposite_map = {
+    "Direction.NORTH": "Direction.SOUTH",
+    "Direction.NORTHEAST": "Direction.SOUTHWEST",
+    "Direction.EAST": "Direction.WEST",
+    "Direction.SOUTHEAST": "Direction.NORTHWEST",
+    "Direction.SOUTH": "Direction.NORTH",
+    "Direction.SOUTHWEST": "Direction.NORTHEAST",
+    "Direction.WEST": "Direction.EAST",
+    "Direction.NORTHWEST": "Direction.SOUTHEAST",
+} %}
+{% set dir_dx = {
+    "Direction.NORTH": 0,
+    "Direction.NORTHEAST": 1,
+    "Direction.EAST": 1,
+    "Direction.SOUTHEAST": 1,
+    "Direction.SOUTH": 0,
+    "Direction.SOUTHWEST": -1,
+    "Direction.WEST": -1,
+    "Direction.NORTHWEST": -1,
+    "Direction.CENTER": 0,
+} %}
+{% set dir_dy = {
+    "Direction.NORTH": 1,
+    "Direction.NORTHEAST": 1,
+    "Direction.EAST": 0,
+    "Direction.SOUTHEAST": -1,
+    "Direction.SOUTH": -1,
+    "Direction.SOUTHWEST": -1,
+    "Direction.WEST": 0,
+    "Direction.NORTHWEST": 1,
+    "Direction.CENTER": 0,
+} %}
+{% set moveDirs = directions + ["Direction.CENTER"] %}
+{% set moveShort = shortDirections + ["C"] %}
+{% set visible_dirs = {
+    "Direction.NORTH": ["Direction.NORTH", "Direction.NORTHEAST", "Direction.NORTHWEST"],
+    "Direction.SOUTH": ["Direction.SOUTH", "Direction.SOUTHEAST", "Direction.SOUTHWEST"],
+    "Direction.EAST": ["Direction.EAST", "Direction.NORTHEAST", "Direction.SOUTHEAST"],
+    "Direction.WEST": ["Direction.WEST", "Direction.NORTHWEST", "Direction.SOUTHWEST"],
+    "Direction.NORTHEAST": ["Direction.NORTHEAST", "Direction.NORTH", "Direction.EAST"],
+    "Direction.NORTHWEST": ["Direction.NORTHWEST", "Direction.NORTH", "Direction.WEST"],
+    "Direction.SOUTHEAST": ["Direction.SOUTHEAST", "Direction.SOUTH", "Direction.EAST"],
+    "Direction.SOUTHWEST": ["Direction.SOUTHWEST", "Direction.SOUTH", "Direction.WEST"],
+} %}
+
+{# Shared macros #}
+{%- macro can_see(facing_idx, dx, dy) -%}
+{%- set facing = directions[facing_idx] -%}
+{%- if facing == "Direction.NORTH" -%}
+{{ "true" if dy >= (dx | abs) else "false" }}
+{%- elif facing == "Direction.NORTHEAST" -%}
+{{ "true" if dx >= 0 and dy >= 0 else "false" }}
+{%- elif facing == "Direction.EAST" -%}
+{{ "true" if dx >= (dy | abs) else "false" }}
+{%- elif facing == "Direction.SOUTHEAST" -%}
+{{ "true" if dx >= 0 and dy <= 0 else "false" }}
+{%- elif facing == "Direction.SOUTH" -%}
+{{ "true" if dy <= -(dx | abs) else "false" }}
+{%- elif facing == "Direction.SOUTHWEST" -%}
+{{ "true" if dx <= 0 and dy <= 0 else "false" }}
+{%- elif facing == "Direction.WEST" -%}
+{{ "true" if dx <= -(dy | abs) else "false" }}
+{%- elif facing == "Direction.NORTHWEST" -%}
+{{ "true" if dx <= 0 and dy >= 0 else "false" }}
+{%- else -%}
+false
+{%- endif -%}
+{%- endmacro -%}
+
+

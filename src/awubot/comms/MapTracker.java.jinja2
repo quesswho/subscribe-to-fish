@@ -1,0 +1,481 @@
+package awubot.comms;
+
+import battlecode.common.MapLocation;
+import awubot.util.Rng;
+import static awubot.Game.*;
+
+/*
+
+Each "unit" is a 3x3 square.
+    The map has at most 20x20 = 400 units.
+These units are "chunked" as 5x5.
+    The map has at most 4x4 = 16 chunks.
+To communicate a specific chunk, it takes 2 + 2 + 25 = 29 bits.
+Each chunk is represented as a bitmask.
+
+King rats maintain a single map tracker which they communicate parts of through the global array.
+Baby rats maintain a map tracker that reflects their understanding of the global map tracker, but also
+store their own tracker that adds in their personal vision.
+
+Baby rats also keep a StringBuilder of unseen units:
+    - It starts with 400 chars (0..399), one per unit.
+    - Whenever a unit is learned (from global or local vision), it is removed.
+    - sampleUnseenUnitCenter() picks a random unit; if it is partially outside the map it is removed
+      and another is sampled. This repeats until we find a valid unit or the builder is empty.
+
+For bytecode, we fully precompute updates for all 60x60x8 robot states. Each case directly updates the
+exact chunk variable and bit without any array indexing or coordinate arithmetic at runtime.
+
+*/
+
+{#
+    Jinja helpers for chunk variable names and inline unit updates.
+    We keep all math in template-time constants so the runtime code is just bit twiddling.
+#}
+{% macro chunk_var(cx, cy) -%}chunk{{cx}}{{cy}}{%- endmacro %}
+
+{% macro update_unit_const(unitX, unitY) -%}
+{%- set chunkX = unitX // 5 -%}
+{%- set chunkY = unitY // 5 -%}
+{%- set localX = unitX - chunkX * 5 -%}
+{%- set localY = unitY - chunkY * 5 -%}
+{%- set bit = localY * 5 + localX -%}
+{%- set unitIndex = unitY * 20 + unitX -%}
+        if ({{ unitX }} <= maxUnitX && {{ unitY }} <= maxUnitY) {
+            int _bit = 1 << {{ bit }};
+            if (({{ chunk_var(chunkX, chunkY) }} & _bit) == 0) {
+                {{ chunk_var(chunkX, chunkY) }} |= _bit;
+                hasNewInfo = true;
+                if (unseenUnits != null) {
+                    removeFromUnseen({{ unitIndex }});
+                }
+            }
+        }
+{%- endmacro %}
+
+{% macro emit_updates_for_state(rx, ry, dir) -%}
+{%- set baseUnitX = rx // 3 -%}
+{%- set baseUnitY = ry // 3 -%}
+{%- set modX = rx % 3 -%}
+{%- set modY = ry % 3 -%}
+{%- for ux in range(-3, 4) -%}
+{%- for uy in range(-3, 4) -%}
+{%- set unitX = baseUnitX + ux -%}
+{%- set unitY = baseUnitY + uy -%}
+{%- if unitX >= 0 and unitX < 20 and unitY >= 0 and unitY < 20 -%}
+{%- set ns = namespace(visible=true) -%}
+{%- for cx in range(3) -%}
+{%- for cy in range(3) -%}
+{%- set dx = ux * 3 - modX + cx -%}
+{%- set dy = uy * 3 - modY + cy -%}
+{%- set dist_ok = (dx * dx + dy * dy) <= 20 -%}
+{%- set vis_ok = (can_see(dir, dx, dy) == "true") -%}
+{%- if not (dist_ok and vis_ok) -%}
+{%- set ns.visible = false -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- if ns.visible %}
+{{ update_unit_const(unitX, unitY) }}
+{%- endif -%}
+{%- endif -%}
+{%- endfor -%}
+{%- endfor -%}
+{%- endmacro %}
+
+{# Emit switch cases for removing unseen units by lowest-set-bit value. #}
+{% macro emit_unseen_cases(chunkX, chunkY) -%}
+{%- for bit in range(25) -%}
+{%- set localX = bit % 5 -%}
+{%- set localY = bit // 5 -%}
+{%- set unitX = chunkX * 5 + localX -%}
+{%- set unitY = chunkY * 5 + localY -%}
+{%- set unitIndex = unitY * 20 + unitX -%}
+            case {{ bitLeftShift(1, bit) }} -> {
+                if ({{ unitX }} <= maxUnitX && {{ unitY }} <= maxUnitY) {
+                    removeFromUnseen({{ unitIndex }});
+                }
+            }
+{%- endfor -%}
+{%- endmacro %}
+
+public class MapTracker {
+    // --- Size constants for units/chunks ---
+    public static final int UNIT_SIZE = 3;               // 3x3 cells per unit
+    public static final int UNITS_PER_SIDE = 20;         // 60 / 3
+    public static final int CHUNK_SIZE = 5;              // 5x5 units per chunk
+    public static final int CHUNKS_PER_SIDE = 4;         // 20 / 5
+    public static final int UNITS_PER_CHUNK = CHUNK_SIZE * CHUNK_SIZE; // 25
+    public static final int CHUNK_COUNT = CHUNKS_PER_SIDE * CHUNKS_PER_SIDE; // 16
+
+    // --- Chunk encoding constants (2 bits x, 2 bits y, 25 bits mask) ---
+    private static final int CHUNK_MASK = (1 << UNITS_PER_CHUNK) - 1; // low 25 bits
+    private static final int CHUNK_Y_SHIFT = UNITS_PER_CHUNK;
+    private static final int CHUNK_X_SHIFT = UNITS_PER_CHUNK + 2;
+
+    // Compile-time string used to seed unseen units (0..399). Using escapes avoids runtime loops.
+    private static final String ALL_UNITS =
+        "\000\001\002\003\004\005\006\007\b\t\n\013\f\r\016\017\020\021\022\023\024\025\026\027\030"
+      + "\031\032\033\034\035\036\037\040\041\"\043\044\045\046\047\050\051\052\053\054\055\056\057\060\061"
+      + "\062\063\064\065\066\067\070\071\072\073\074\075\076\077\100\101\102\103\104\105\106\107\110\111\112"
+      + "\113\114\115\116\117\120\121\122\123\124\125\126\127\130\131\132\133\\\135\136\137\140\141\142\143"
+      + "\144\145\146\147\150\151\152\153\154\155\156\157\160\161\162\163\164\165\166\167\170\171\172\173\174"
+      + "\175\176\177\200\201\202\203\204\205\206\207\210\211\212\213\214\215\216\217\220\221\222\223\224\225"
+      + "\226\227\230\231\232\233\234\235\236\237\240\241\242\243\244\245\246\247\250\251\252\253\254\255\256"
+      + "\257\260\261\262\263\264\265\266\267\270\271\272\273\274\275\276\277\300\301\302\303\304\305\306\307"
+      + "\310\311\312\313\314\315\316\317\320\321\322\323\324\325\326\327\330\331\332\333\334\335\336\337\340"
+      + "\341\342\343\344\345\346\347\350\351\352\353\354\355\356\357\360\361\362\363\364\365\366\367\370\371"
+      + "\372\373\374\375\376\377\u0100\u0101\u0102\u0103\u0104\u0105\u0106\u0107\u0108\u0109\u010a\u010b\u010c\u010d\u010e\u010f\u0110\u0111\u0112"
+      + "\u0113\u0114\u0115\u0116\u0117\u0118\u0119\u011a\u011b\u011c\u011d\u011e\u011f\u0120\u0121\u0122\u0123\u0124\u0125\u0126\u0127\u0128\u0129\u012a\u012b"
+      + "\u012c\u012d\u012e\u012f\u0130\u0131\u0132\u0133\u0134\u0135\u0136\u0137\u0138\u0139\u013a\u013b\u013c\u013d\u013e\u013f\u0140\u0141\u0142\u0143\u0144"
+      + "\u0145\u0146\u0147\u0148\u0149\u014a\u014b\u014c\u014d\u014e\u014f\u0150\u0151\u0152\u0153\u0154\u0155\u0156\u0157\u0158\u0159\u015a\u015b\u015c\u015d"
+      + "\u015e\u015f\u0160\u0161\u0162\u0163\u0164\u0165\u0166\u0167\u0168\u0169\u016a\u016b\u016c\u016d\u016e\u016f\u0170\u0171\u0172\u0173\u0174\u0175\u0176"
+      + "\u0177\u0178\u0179\u017a\u017b\u017c\u017d\u017e\u017f\u0180\u0181\u0182\u0183\u0184\u0185\u0186\u0187\u0188\u0189\u018a\u018b\u018c\u018d\u018e\u018f";
+
+    // Map state: 16 chunks, each with 25 bits. Kept as individual fields for direct updates.
+    {% for cy in range(4) %}
+    {% for cx in range(4) %}
+    private int {{ chunk_var(cx, cy) }};
+    {% endfor %}
+    {% endfor %}
+
+    // Tracks whether any new info was added since last consumption.
+    // Tracks whether any new chunk bits were added since last consumeNewInfo().
+    // This lets callers skip scanning all chunks when nothing changed.
+    private boolean hasNewInfo;
+
+    // Optional unseen-unit bag for explorers. Null when not tracking unseen units.
+    private final StringBuilder unseenUnits;
+
+    // Highest unit indices that still fit fully inside the map (inclusive).
+    private final int maxUnitX;
+    private final int maxUnitY;
+
+    /**
+     * Default constructor for trackers that do not need an unseen-units bag
+     * (e.g., the king's authoritative tracker).
+     */
+    public MapTracker() {
+        this(false);
+    }
+
+    /**
+     * @param trackUnseen whether to track unseen units using a StringBuilder (baby rat explorers).
+     * The StringBuilder is seeded from ALL_UNITS so no runtime loops are needed at init time.
+     */
+    public MapTracker(boolean trackUnseen) {
+        this.maxUnitX = (mapWidth - UNIT_SIZE) / UNIT_SIZE;
+        this.maxUnitY = (mapHeight - UNIT_SIZE) / UNIT_SIZE;
+        this.unseenUnits = trackUnseen ? new StringBuilder(ALL_UNITS) : null;
+    }
+
+    /**
+     * Returns true if a unit index lies completely on the map.
+     * Partial units are treated as out-of-bounds and should never be marked seen.
+     */
+    private boolean isUnitInsideMap(int unitX, int unitY) {
+        return unitX >= 0 && unitY >= 0 && unitX <= maxUnitX && unitY <= maxUnitY;
+    }
+
+    /**
+     * Converts (unitX, unitY) into a stable 0..399 index (row-major by Y).
+     * This matches the ordering used by the unseen-unit StringBuilder.
+     */
+    private static int unitIndex(int unitX, int unitY) {
+        return unitY * UNITS_PER_SIDE + unitX;
+    }
+
+    /**
+     * Returns the chunk index (0..15) from chunk coordinates.
+     */
+    private static int chunkIndexFromCoords(int chunkX, int chunkY) {
+        return (chunkY << 2) | chunkX;
+    }
+
+    /**
+     * Checks whether a unit has been seen. Out-of-map units are treated as seen
+     * so callers don't try to explore invalid space.
+     */
+    public boolean isUnitSeen(int unitX, int unitY) {
+        if (!isUnitInsideMap(unitX, unitY)) return true;
+        int chunkX = unitX / CHUNK_SIZE;
+        int chunkY = unitY / CHUNK_SIZE;
+        int localX = unitX - chunkX * CHUNK_SIZE;
+        int localY = unitY - chunkY * CHUNK_SIZE;
+        int bit = 1 << (localY * CHUNK_SIZE + localX);
+        int idx = chunkIndexFromCoords(chunkX, chunkY);
+        return switch (idx) {
+            {% for cy in range(4) %}
+            {% for cx in range(4) %}
+            case {{ cy * 4 + cx }} -> ({{ chunk_var(cx, cy) }} & bit) != 0;
+            {% endfor %}
+            {% endfor %}
+            default -> true;
+        };
+    }
+
+    /**
+     * Marks a unit as seen, updating both the chunk mask and the unseen-unit bag.
+     * @return true if this call added new information, false if it was already seen or invalid.
+     */
+    public boolean markUnitSeen(int unitX, int unitY) {
+        if (!isUnitInsideMap(unitX, unitY)) return false;
+        int chunkX = unitX / CHUNK_SIZE;
+        int chunkY = unitY / CHUNK_SIZE;
+        int localX = unitX - chunkX * CHUNK_SIZE;
+        int localY = unitY - chunkY * CHUNK_SIZE;
+        int bit = 1 << (localY * CHUNK_SIZE + localX);
+        int idx = chunkIndexFromCoords(chunkX, chunkY);
+        switch (idx) {
+            {% for cy in range(4) %}
+            {% for cx in range(4) %}
+            case {{ cy * 4 + cx }} -> {
+                if (({{ chunk_var(cx, cy) }} & bit) != 0) return false;
+                {{ chunk_var(cx, cy) }} |= bit;
+                hasNewInfo = true;
+                if (unseenUnits != null) {
+                    removeFromUnseen(unitIndex(unitX, unitY));
+                }
+                return true;
+            }
+            {% endfor %}
+            {% endfor %}
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Returns the raw 25-bit mask for a chunk, or 0 if the chunk coords are invalid.
+     */
+    public int getChunkMask(int chunkX, int chunkY) {
+        int idx = chunkIndexFromCoords(chunkX, chunkY);
+        return switch (idx) {
+            {% for cy in range(4) %}
+            {% for cx in range(4) %}
+            case {{ cy * 4 + cx }} -> {{ chunk_var(cx, cy) }};
+            {% endfor %}
+            {% endfor %}
+            default -> 0;
+        };
+    }
+
+    /**
+     * Encodes a chunk (x, y, mask) into a 29-bit payload suitable for comms.
+     */
+    public static int encodeChunk(int chunkX, int chunkY, int mask) {
+        return ((chunkX & 0b11) << CHUNK_X_SHIFT) | ((chunkY & 0b11) << CHUNK_Y_SHIFT) | (mask & CHUNK_MASK);
+    }
+
+    /**
+     * Convenience wrapper around encodeChunk() using this tracker's current data.
+     */
+    public int encodeChunk(int chunkX, int chunkY) {
+        return encodeChunk(chunkX, chunkY, getChunkMask(chunkX, chunkY));
+    }
+
+    /**
+     * Decodes chunk X from a 29-bit payload.
+     */
+    public static int decodeChunkX(int encoded) {
+        return (encoded >>> CHUNK_X_SHIFT) & 0b11;
+    }
+
+    /**
+     * Decodes chunk Y from a 29-bit payload.
+     */
+    public static int decodeChunkY(int encoded) {
+        return (encoded >>> CHUNK_Y_SHIFT) & 0b11;
+    }
+
+    /**
+     * Decodes the 25-bit chunk mask from a 29-bit payload.
+     */
+    public static int decodeChunkMask(int encoded) {
+        return encoded & CHUNK_MASK;
+    }
+
+    /**
+     * Applies an encoded chunk payload, merging it into this tracker.
+     * @return true if any previously unseen bits were added.
+     */
+    public boolean applyEncodedChunk(int encoded) {
+        return mergeChunkMask(decodeChunkX(encoded), decodeChunkY(encoded), decodeChunkMask(encoded));
+    }
+
+    /**
+     * Merges another tracker's knowledge into this one (bitwise OR per chunk).
+     * @return true if new info was added.
+     */
+    public boolean mergeFrom(MapTracker other) {
+        boolean changed = false;
+        {% for cy in range(4) %}
+        {% for cx in range(4) %}
+        if (mergeChunkMask({{ cx }}, {{ cy }}, other.{{ chunk_var(cx, cy) }})) {
+            changed = true;
+        }
+        {% endfor %}
+        {% endfor %}
+        return changed;
+    }
+
+    /**
+     * Finds a chunk that differs between two trackers and returns the newer chunk's payload.
+     * This is intended for baby rats diffing local vs. global before sending updates.
+     * @return encoded chunk payload, or -1 if no differences exist.
+     */
+    public static int findDiffChunk(MapTracker newer, MapTracker baseline) {
+        {% for cy in range(4) %}
+        {% for cx in range(4) %}
+        if (newer.{{ chunk_var(cx, cy) }} != baseline.{{ chunk_var(cx, cy) }}) {
+            return encodeChunk({{ cx }}, {{ cy }}, newer.{{ chunk_var(cx, cy) }});
+        }
+        {% endfor %}
+        {% endfor %}
+        return -1;
+    }
+
+    /**
+     * Samples a random unseen unit and returns the center cell of that 3x3 square.
+     * If the sampled unit is partially outside the map, it is removed and we try again.
+     * @return center location or null when no valid unseen units remain.
+     */
+    public MapLocation sampleUnseenUnitCenter() {
+        if (unseenUnits == null || unseenUnits.length() == 0) return null;
+        while (unseenUnits.length() > 0) {
+            int idx = Rng.mcg() % unseenUnits.length();
+            int unitIndex = unseenUnits.charAt(idx);
+            int unitX = unitIndex % UNITS_PER_SIDE;
+            int unitY = unitIndex / UNITS_PER_SIDE;
+            if (!isUnitInsideMap(unitX, unitY)) {
+                // Lazily discard invalid units to avoid an init-time scan.
+                removeFromUnseenAt(idx);
+                continue;
+            }
+            return new MapLocation(unitX * UNIT_SIZE + 1, unitY * UNIT_SIZE + 1);
+        }
+        return null;
+    }
+
+    /**
+     * @return true if this tracker still has unseen units to explore.
+     */
+    public boolean hasUnseenUnits() {
+        return unseenUnits != null && unseenUnits.length() > 0;
+    }
+
+    /**
+     * @return true if new info was added since last call, and clears the flag.
+     */
+    public boolean consumeNewInfo() {
+        boolean ret = hasNewInfo;
+        hasNewInfo = false;
+        return ret;
+    }
+
+    /**
+     * Removes a unit index from unseenUnits by swapping with the last char.
+     * This avoids O(n) shifts when removing frequently.
+     */
+    private void removeFromUnseenAt(int pos) {
+        int last = unseenUnits.length() - 1;
+        if (pos != last) {
+            unseenUnits.setCharAt(pos, unseenUnits.charAt(last));
+        }
+        // setLength is cheaper than deleteCharAt when removing the final char.
+        unseenUnits.setLength(last);
+    }
+
+    /**
+     * Removes a unit index from unseenUnits by searching for its char.
+     * This is only called when a new unit is learned, so total cost is bounded.
+     */
+    private void removeFromUnseen(int unitIndex) {
+        if (unseenUnits == null) return;
+        char target = (char) unitIndex;
+        // StringBuilder.indexOf is bytecode-cheap, even if O(n) work.
+        int pos = unseenUnits.indexOf(String.valueOf(target));
+        if (pos >= 0) {
+            removeFromUnseenAt(pos);
+        }
+    }
+
+    /**
+     * Merges a raw 25-bit mask into a specific chunk, updating unseen units.
+     */
+    private boolean mergeChunkMask(int chunkX, int chunkY, int mask) {
+        int idx = chunkIndexFromCoords(chunkX, chunkY);
+        mask &= CHUNK_MASK;
+        switch (idx) {
+            {% for cy in range(4) %}
+            {% for cx in range(4) %}
+            case {{ cy * 4 + cx }} -> {
+                int existing = {{ chunk_var(cx, cy) }};
+                int newBits = mask & ~existing;
+                if (newBits == 0) return false;
+                {{ chunk_var(cx, cy) }} = existing | mask;
+                hasNewInfo = true;
+                if (unseenUnits != null) {
+                    while (newBits != 0) {
+                        // Extract lowest-set bit with bit tricks and switch on its value.
+                        // This avoids trailingZeros/div/mod in the hot loop.
+                        int lsb = newBits & -newBits;
+                        newBits ^= lsb;
+                        switch (lsb) {
+{{ emit_unseen_cases(cx, cy) }}
+                            default -> { }
+                        }
+                    }
+                }
+                return true;
+            }
+            {% endfor %}
+            {% endfor %}
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    /**
+     * Updates all units that are fully visible from the current (direction, x, y).
+     * This is the hot path: we precompute all 60x60x8 cases and update exact chunk vars.
+     */
+    public void updateVisibleUnits() {
+        switch (myDir.ordinal()) {
+            {% for i in range(8) %}
+            case {{ i }} -> updateVisibleUnitsDir{{ i }}();
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    // Generated helpers: direction -> row -> column. Splitting keeps method size under limits
+    // while still fully precomputing all 60x60x8 update states.
+    {% for dir in range(8) %}
+    private void updateVisibleUnitsDir{{ dir }}() {
+        switch (myLocY) {
+            {% for ry in range(60) %}
+            case {{ ry }} -> updateVisibleUnitsDir{{ dir }}Row{{ ry }}();
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% for ry in range(60) %}
+    private void updateVisibleUnitsDir{{ dir }}Row{{ ry }}() {
+        switch (myLocX) {
+            {% for rx in range(60) %}
+            case {{ rx }} -> {
+{{ emit_updates_for_state(rx, ry, dir) }}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% endfor %}
+
+    {% endfor %}
+}

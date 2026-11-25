@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Plays one game on the official engine (through Gradle) and saves a replay for the client.
+
+fish plays move for move like the official engine, so a game found with tools/sprt or tools/run can be watched:
+
+  tools/replay wt HEAD --map rift --seed 7          -> matches/wt-vs-HEAD-rift-7.bc26
+"""
+import argparse
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("a", nargs="?", default="wt")
+    ap.add_argument("b", nargs="?", default="wt")
+    ap.add_argument("--map", default="DefaultSmall")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", help="replay file (default matches/A-vs-B-MAP-SEED.bc26)")
+    args = ap.parse_args()
+    a, b = F.build_bot(args.a), F.build_bot(args.b)
+    mp = F.map_path(args.map)
+    safe = lambda s: "".join(c if c.isalnum() or c in "-_." else "_" for c in s)
+    out = Path(args.out or F.ROOT / "matches" / f"{safe(args.a)}-vs-{safe(args.b)}-{mp.stem}-{args.seed}.bc26")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    env = dict(os.environ, JAVA_HOME=str(F.JDK))
+    cmd = [str(F.ROOT / "gradlew"), "run", "-q", "--console=plain", f"-PteamA={a.package}",
+           f"-PteamB={b.package}", f"-PclassLocationA={a.classes}", f"-PclassLocationB={b.classes}",
+           f"-Pmaps={mp.stem}", f"-PmapPath={mp.parent}", f"-Pseed={args.seed}", f"-Preplay={out}",
+           "-PoutputVerbose=false", "-x", "unpackClient"]
+    with F.slot():  # gradle plus the official engine: more than a fish worker, but one at a time is enough
+        r = subprocess.run(cmd, cwd=F.ROOT, env=env, capture_output=True, text=True)
+    for line in r.stdout.splitlines():
+        if "wins" in line or "Reason" in line:
+            print(line.replace("[server]", "").strip())
+    if r.returncode != 0:
+        print(r.stdout[-3000:], r.stderr[-3000:])
+        return 3
+    print(f"replay: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

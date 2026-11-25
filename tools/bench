@@ -1,0 +1,54 @@
+#!/usr/bin/env python3
+"""Engine throughput: plays the same bot against itself on a set of maps and reports games and rounds per second.
+
+  tools/bench                          a few pool maps, one worker per core
+  tools/bench --maps rift,keepout --games 20 --workers 4
+  tools/bench --official               also times one game on the official engine for comparison
+"""
+import argparse
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("bot", nargs="?", default="wt")
+    ap.add_argument("--maps", default="DefaultSmall,DefaultMedium,DefaultLarge,rift,cheesefarm,keepout")
+    ap.add_argument("--games", type=int, default=24)
+    ap.add_argument("--workers", type=int, default=F.default_workers())
+    ap.add_argument("--official", action="store_true")
+    args = ap.parse_args()
+    F.build_engine()
+    bot = F.build_bot(args.bot)
+    maps = F.resolve_maps(args.maps)
+    games = [F.Game(maps[i % len(maps)], 1000 + i // len(maps), bot, bot) for i in range(args.games)]
+    start = time.monotonic()
+    rounds = []
+
+    def done(g):
+        if "error" in g.result:
+            print(f"  {g.map.stem} seed {g.seed}: error {g.result['error']}")
+            return
+        rounds.append(g.result["round"])
+        print(f"  {g.map.stem:20s} seed {g.seed}: {g.result['round']:4d} rounds in {g.result['seconds']:5.1f}s", flush=True)
+
+    F.play(games, workers=args.workers, cache=F.GameCache(False), on_result=done)
+    wall = time.monotonic() - start
+    print(f"{len(rounds)} games, {sum(rounds)} rounds in {wall:.0f}s with {args.workers} workers: "
+          f"{len(rounds) / wall:.2f} games/s, {sum(rounds) / wall:.0f} rounds/s (first games include JVM warm-up)")
+    if args.official:
+        m = maps[0]
+        t = time.monotonic()
+        subprocess.run([str(F.ROOT / "tools/replay"), args.bot, args.bot, "--map", str(m), "--seed", "1000",
+                        "--out", str(F.STATE / "bench.bc26")], check=False)
+        print(f"official engine, one game on {m.stem}: {time.monotonic() - t:.0f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

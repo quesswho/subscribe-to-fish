@@ -1,0 +1,999 @@
+package awubot;
+
+import battlecode.common.*;
+import static awubot.util.Util.*;
+import awubot.util.Rng;
+import awubot.util.Profiler;
+import awubot.util.string.FastMapLocationSet;
+import static awubot.Game.*;
+import static awubot.robot.rat.BabyRat.*; // TODO: make pathfinder compatible with rat king
+import awubot.robot.king.RatKing;
+import awubot.comms.GlobalArray;
+
+// IF TLE: lower these constants (especially MAX_BUG_ITERS)
+{% set MAX_BUG_ITERS = 5 %}
+{% set MAX_PATH = 13 %}
+
+class Config {
+    static boolean dirtAllowed = false;
+    public static boolean allowDirt() {
+        if(dirtAllowed) return true;
+        var globalCheese = rc.getGlobalCheese();
+        if(time >= 100 && globalCheese >= 1500 || globalCheese >= 3000) {
+            dirtAllowed = true;
+        }
+        return dirtAllowed;
+    }
+}
+
+class BugnavInstance {
+    MapLocation target;
+
+    // false for the instances spawned for lookahead
+    boolean isMaster;
+    // child instances for lookahead
+    BugnavInstance leftBug, rightBug;
+    // these are reset when we physically move
+    boolean leftDone, rightDone;
+    // detect movement with this
+    MapLocation lastLoc;
+    Direction lastDir;
+    // loop detection
+    long[] guessedLeft, guessedRight;
+    // where we want to go, in case path length is zero, we should turn to here
+    MapLocation outOfSightLoc;
+
+    // extra "return variables" for lookahead instances
+    boolean hitEdge = false, outOfSight = false, arrived = false;
+
+    FastMapLocationSet vis = new FastMapLocationSet();
+    boolean givenUp = false;
+
+    Direction bottomDir, topDir;
+
+    // state (you can reconstruct the entire state from these variables + target/bottomDir)
+    MapLocation pos;
+    int stackSize;
+    int emptyStackTurns;
+    boolean leftTurn;
+
+    int windingNumber = 0;
+
+    public int nextPathIndex;
+    {% for i in range(MAX_PATH) %}
+    public MapLocation path{{i}};
+    {% endfor %}
+
+    void clearPath() {
+        pos = myLoc;
+        nextPathIndex = 0;
+        stackSize = 0;
+        windingNumber = 0;
+        emptyStackTurns = 1000;
+        bottomDir = topDir = pos.directionTo(target);
+        leftBug = rightBug = null;
+        {% for i in range(MAX_PATH) %}
+        path{{i}} = new MapLocation(-1000, -1000);
+        {% endfor %}
+    }
+
+    BugnavInstance(boolean leftTurn, MapLocation target) {
+        this.leftTurn = leftTurn;
+        this.target = target;
+        this.isMaster = true;
+        guessedLeft = new long[mapHeight];
+        guessedRight = new long[mapHeight];
+        clearPath();
+    }
+
+    BugnavInstance(MapLocation pos, boolean leftTurn, MapLocation target, boolean isMaster) {
+        this.leftTurn = leftTurn;
+        this.target = target;
+        this.isMaster = isMaster;
+        clearPath();
+        this.pos = pos;
+        appendCurrentPosition();
+    }
+
+    void appendPosition(MapLocation loc) {
+        switch (nextPathIndex) {
+            {% for i in range(MAX_PATH) %}
+            case {{i}} -> {
+                if (!path{{(i - 1 + MAX_PATH) % MAX_PATH}}.equals(loc)) {
+                    if(vis.contains(loc) && (stackSize >= 8 || Math.abs(windingNumber) >= 8)) {
+                        // indicate("loop detected");
+                        // println("loop detected");
+                        givenUp = true;
+                    }
+                    vis.add(loc);
+                    path{{i}} = loc;
+                    nextPathIndex = {{(i + 1) % MAX_PATH}};
+                }
+            }
+            {% endfor %}
+            default -> {
+                assert false;
+            }
+        }
+    }
+
+    void appendCurrentPosition() {
+        appendPosition(pos);
+    }
+
+    MapLocation getRecentPos(int i) {
+        switch ((nextPathIndex - i + {{MAX_PATH - 1}}) % {{MAX_PATH}}) {
+            {% for i in range(MAX_PATH) %}
+            case {{i}} -> {
+                return path{{i}};
+            }
+            {% endfor %}
+            default -> {
+                assert false : "index out of range";
+                return null;
+            }
+        }
+    }
+
+    private static boolean isPassable(MapLocation loc) throws GameActionException {
+        if(isRatKing) return CellTracker.isKingPassable(loc);
+        RobotInfo robot;
+        return CellTracker.isPassable(loc) && !RobotTracker.kingSet.contains(loc) && (Config.allowDirt() || !CellTracker.isDirt(loc) || CellTracker.isWallAdjacent(loc))
+            && !(canSense(myLoc, loc, myDir) && rc.getRawCheese() < 20 && (robot = rc.senseRobotAtLocation(loc)) != null && robot.team == team && robot.cheeseAmount >= 40);
+    }
+
+    private static boolean possiblyPassable(MapLocation loc) throws GameActionException {
+        if(isRatKing) return CellTracker.isKingPassable(loc);
+        return (CellTracker.isPassable(loc) || !CellTracker.isSeen(loc)) && !RobotTracker.kingSet.contains(loc) && (Config.allowDirt() || !CellTracker.isDirt(loc) || CellTracker.isWallAdjacent(loc));
+    }
+
+    boolean doLookahead() throws GameActionException {
+        // indicate("lookahead!!");
+        if(leftBug == null) {
+            // initialise
+            leftBug = new BugnavInstance(pos, true, target, false);
+            rightBug = new BugnavInstance(pos, false, target, false);
+            lastLoc = new MapLocation(-1, -1);
+            lastDir = Direction.CENTER;
+            return true;
+        }
+        // rc.setIndicatorDot(leftBug.pos, 255, 255, 0);
+        // rc.setIndicatorDot(rightBug.pos, 255, 255, 0);
+        // // Profiler.begin();
+        if(!myLoc.equals(lastLoc) || !myDir.equals(lastDir)) {
+            // we moved, so we might be able to advance previously stuck stuff further
+            lastLoc = myLoc;
+            lastDir = myDir;
+            leftDone = leftBug.hitEdge || leftBug.nextPathIndex == {{MAX_PATH - 1}};
+            rightDone = rightBug.hitEdge || rightBug.nextPathIndex == {{MAX_PATH - 1}};
+        }
+
+        if(!(leftDone && rightDone)) {
+            {% macro advance(side) %}
+            // indicate("advance {{side}}");
+            {{side}}Bug.outOfSight = false;
+            {{side}}Done = !{{side}}Bug.advance();
+            // indicate({{side}}Bug.pos);
+            // rc.setIndicatorDot({{side}}Bug.pos, 255, 0, 255);
+            {% endmacro %}
+            if(rightDone) {
+                {{ advance("left") }}
+            } else if(leftDone) {
+                {{ advance("right") }}
+            } else if(leftBug.nextPathIndex > rightBug.nextPathIndex) {
+                {{ advance("right") }}
+            } else {
+                {{ advance("left") }}
+            }
+        }
+        // // Profiler.end("lookahead");
+
+        boolean leftReady = leftBug.nextPathIndex >= 5 || leftBug.hitEdge || leftBug.outOfSight || leftBug.arrived;
+        boolean rightReady = rightBug.nextPathIndex >= 5 || rightBug.hitEdge || rightBug.outOfSight || rightBug.arrived;
+        // indicate("ready " + leftReady + " " + rightReady);
+        if(!myLoc.equals(pos) && (!leftReady || !rightReady)) return !(leftDone && rightDone);
+        // indicate("going ahead");
+
+        {% macro score(bug) %} Math.sqrt({{bug}}.pos.distanceSquaredTo(target)) + {{bug}}.nextPathIndex * 0.7 {% endmacro %}
+        var leftScore = {{ score("leftBug") }};
+        var rightScore = {{ score("rightBug") }};
+        // indicate("lookahead" + pos);
+        // indicate(leftBug.pos);
+        // indicate(leftScore);
+        // indicate(rightBug.pos);
+        // indicate(rightScore);
+
+        {% macro chooseBug(bug) %}
+        var bug = {{bug}};
+        if(bug.leftTurn) {
+            guessedLeft[pos.y] |= 1l << pos.x;
+        } else {
+            guessedRight[pos.y] |= 1l << pos.x;
+        }
+        {% for field in ["pos", "stackSize", "emptyStackTurns", "leftTurn", "bottomDir", "topDir", "outOfSightLoc"] %}
+        {{field}} = bug.{{field}};
+        {% endfor %}
+        copyPath: {
+            {% for i in range(MAX_PATH) %}
+            {% if i %}
+            if(bug.nextPathIndex == {{i}}) break copyPath;
+            {% endif %}
+            appendPosition(bug.path{{i}});
+            {% endfor %}
+        }
+        leftBug = null;
+        rightBug = null;
+        {% endmacro %}
+
+        if(leftBug.arrived) {
+            {{ chooseBug("leftBug") }}
+        } else if(leftBug.arrived) {
+            {{ chooseBug("rightBug") }}
+        } else if(leftBug.hitEdge != rightBug.hitEdge) {
+            {{ chooseBug("rightBug.hitEdge ? leftBug : rightBug") }}
+        } else {
+            var better = leftScore < rightScore ? leftBug : rightBug;
+            var worse = leftScore < rightScore ? rightBug : leftBug;
+            if(!better.outOfSight && worse.outOfSight) {
+                // indicate("clear winner");
+                {{ chooseBug("better") }}
+            } else if(!better.outOfSight || myLoc.isAdjacentTo(pos)) {
+                // indicate("unclear, guessing");
+                leftScore = Math.pow(leftScore, 15);
+                rightScore = Math.pow(rightScore, 15);
+                var total = leftScore + rightScore;
+                leftScore /= total;
+                rightScore /= total;
+                // indicate(leftScore);
+                // indicate(rightScore);
+                {{ chooseBug("Rng.mcg() < rightScore * 0x7fffffff ? leftBug : rightBug") }}
+            }
+        }
+        return true;
+    }
+
+    // false = halt bug
+    boolean advance() throws GameActionException {
+        if(leftBug != null) {
+            // we are currently in the middle of a lookahead
+            return doLookahead();
+        }
+        // indicate("leftTurn " + leftTurn);
+
+        if(pos.isAdjacentTo(target)) {
+            pos = target;
+            appendCurrentPosition();
+            arrived = true;
+            return false;
+        }
+
+        var dirToTarget = pos.directionTo(target);
+        if(dirToTarget != bottomDir) {
+            // indicate("changing bottomDir from " + bottomDir + " to " + dirToTarget);
+            if(dirToTarget == Direction.CENTER) return false;
+            // indicate("NEW DIR " + dirToTarget);
+            if(dirToTarget == bottomDir.rotateLeft()) {
+                windingNumber++;
+                // indicate("INCREMENT");
+            } else if(dirToTarget == bottomDir.rotateRight()) {
+                windingNumber--;
+                // indicate("DECREMENT");
+            }
+            if(stackSize == 0) {
+                bottomDir = topDir = dirToTarget;
+            } else {
+                {% macro updateBottomDir(turnDir, reverseDir) %}
+                if(dirToTarget == bottomDir.rotate{{reverseDir}}()) {
+                    bottomDir = dirToTarget;
+                    stackSize++;
+                } else {
+                    if(dirToTarget != bottomDir.rotate{{turnDir}}()) {
+                        // System.out.println("unexpected direction change from " + bottomDir + " to " + dirToTarget);
+                        clearPath();
+                    } else {
+                        bottomDir = dirToTarget;
+                        stackSize--;
+                        if(stackSize < 0) {
+                            stackSize = 0;
+                            topDir = bottomDir;
+                        }
+                    }
+                }
+                {% endmacro %}
+                if(leftTurn) {
+                    {{ updateBottomDir("Left", "Right") }}
+                } else {
+                    {{ updateBottomDir("Right", "Left") }}
+                }
+            }
+        }
+        // indicate("winding number " + windingNumber);
+        // indicate("direction " + pos + " " + topDir + " " + bottomDir + " " + leftTurn);
+
+        MapLocation greedyLoc = pos.add(bottomDir);
+        if(stackSize <= 1) {
+            {% macro go(where) %}
+            if(isPassable({{where}}Loc) && chebyshevDistance(myLoc, {{where}}Loc) <= 5) {
+                // indicate("{{where}}Loc " + {{where}}Loc);
+                pos = {{where}}Loc;
+                topDir = bottomDir;
+                stackSize = 0;
+                emptyStackTurns++;
+                appendCurrentPosition();
+                return true;
+            }
+            // rc.setIndicatorDot({{where}}Loc, 0, 255, 255);
+            outOfSight = true;
+            outOfSightLoc = {{where}}Loc;
+            return false;
+            {% endmacro %}
+            var greedyGood = possiblyPassable(greedyLoc);
+            if(greedyGood) {
+                {{ go("greedy") }}
+            }
+            var leftLoc = pos.add(bottomDir.rotateLeft());
+            var rightLoc = pos.add(bottomDir.rotateRight());
+            var leftGood = possiblyPassable(leftLoc);
+            var rightGood = possiblyPassable(rightLoc);
+            if(leftGood && !rightGood) {
+                {{ go("left") }}
+            }
+            if(!leftGood && rightGood) {
+                {{ go("right") }}
+            }
+            if(leftGood && rightGood) {
+                if(leftLoc.distanceSquaredTo(target) < rightLoc.distanceSquaredTo(target)) {
+                    {{ go("left") }}
+                } else {
+                    {{ go("right") }}
+                }
+            }
+        }
+
+        // guess rotation direction (kinda inefficient but wtv)
+        if(isMaster && stackSize == 0 && (CellTracker.isSeen(greedyLoc) || RobotTracker.kingSet.contains(greedyLoc))) {
+            if(emptyStackTurns >= 2) {
+                boolean pastLeft = ((guessedLeft[pos.y] >> pos.x) & 1l) != 0;
+                boolean pastRight = ((guessedRight[pos.y] >> pos.x) & 1l) != 0;
+                if(pastLeft && pastRight) {
+                    // indicate("idk which way");
+                    // just pick randomly, we have no idea what's going on
+                    // leftTurn = Rng.mcg() >> 30 == 0;
+                    // keep going the same way, we'll get there eventually
+                } else if(pastLeft) {
+                    // indicate("past left");
+                    // try the other way
+                    leftTurn = false;
+                    guessedRight[pos.y] |= 1l << pos.x;
+                } else if(pastRight) {
+                    // indicate("past right");
+                    leftTurn = true;
+                    guessedLeft[pos.y] |= 1l << pos.x;
+                } else if(isRatKing) {
+                    if(leftTurn) {
+                        guessedLeft[pos.y] |= 1l << pos.x;
+                    } else {
+                        guessedRight[pos.y] |= 1l << pos.x;
+                    }
+                } else {
+                    // indicate("looking ahead");
+                    return doLookahead();
+                }
+            } else if(emptyStackTurns < 0) {
+                emptyStackTurns = 0;
+            }
+        }
+        if(leftTurn) {
+            return tryDirsLeft();
+        } else {
+            return tryDirsRight();
+        }
+    }
+    {% macro tryDirs(turnDir, reverseDir) %}
+    private boolean tryDirs{{turnDir}}() throws GameActionException {
+        var tryDir = topDir.rotate{{reverseDir}}().rotate{{reverseDir}}();
+        {% for turns in range(-2, 7) %}
+        {% if turns < 0 %}
+        if(stackSize + {{turns}} >= 0
+           // only try -2 for diagonals
+           {% if turns == -2 %}
+           && Math.abs(topDir.dx + topDir.dy) != 1
+           {% endif %}
+           )
+        {% endif %}
+        {
+            // System.out.println("T " + tryDir);
+            var nextPos = pos.add(tryDir);
+            if(!rc.onTheMap(nextPos)) {
+                 if(isMaster) {
+                    // avoid following the edge of the map (TODO: 1-thick borders)
+                    // indicate("bugnav edge: leftTurn = " + leftTurn + " bottomDir = " + bottomDir + " tryDir = " + tryDir + " turns = " + {{turns}});
+                    if(vis.contains(nextPos)) {
+                        // indicate("gave up at edge");
+                        // System.out.println("gave up at edge");
+                        givenUp = true;
+                        return false;
+                    }
+                    vis.add(nextPos);
+                    leftTurn = !leftTurn;
+                    clearPath();
+                    // don't guess turn direction, we know that one direction is bad already
+                    emptyStackTurns = -1000;
+                    // start again
+                    return tryDirs{{reverseDir}}();
+                } else {
+                    hitEdge = true;
+                }
+                // // Profiler.end("bugnav " + {{turns}} + " " + isMaster);
+                // indicate("bugnav " + {{turns}} + " " + isMaster);
+                return false;
+            }
+            var isPassable = isPassable(nextPos);
+            if(isPassable && chebyshevDistance(myLoc, nextPos) > 5 || possiblyPassable(nextPos) && !isPassable) {
+                // rc.setIndicatorDot(nextPos, 0, 255, 255);
+                outOfSight = true;
+                outOfSightLoc = nextPos;
+                // // Profiler.end("bugnav " + {{turns}} + " " + isMaster);
+                // indicate("bugnav " + {{turns}} + " " + isMaster);
+                return false;
+            }
+            if(isPassable) {
+                pos = nextPos;
+                topDir = tryDir;
+                {% if turns %}
+                stackSize += {{turns}};
+                {% endif %}
+                if(stackSize == 0) {
+                    emptyStackTurns++;
+                } else {
+                    emptyStackTurns = 0;
+                }
+                appendCurrentPosition();
+                // // Profiler.end("bugnav " + {{turns}} + " " + isMaster);
+                // indicate("bugnav " + {{turns}} + " " + isMaster);
+                return true;
+            }
+        }
+        tryDir = tryDir.rotate{{turnDir}}();
+        {% endfor %}
+        // println("no valid move found from " + pos);
+        return false;
+    }
+    {% endmacro %}
+    {{ tryDirs("Left", "Right") }}
+    {{ tryDirs("Right", "Left") }}
+}
+
+public class Pathfinder {
+    public static void init() {
+        if(time <= 2) {
+            Config.dirtAllowed = true;
+        }
+    }
+    static BugnavInstance bug;
+    static int lastDist = 0;
+
+    public static  MapLocation getBugPos() {
+        return bug.pos;
+    }
+
+    public static boolean givenUp() {
+        return bug != null && bug.givenUp;
+    }
+
+    static MapLocation lastBugPos, lastLoc, secondLastBugPos, secondLastLoc;
+    static int reps = 0;
+
+    public static void reset() {
+        bug = null;
+    }
+
+    public static Direction getMove(MapLocation target) throws GameActionException {
+        // indicate("lastDist " + lastDist);
+        // TODO: better handling when target changes
+        if(bug == null || !target.equals(bug.target)) {
+            if(bug != null && target.isAdjacentTo(bug.target)) {
+                // indicate("target changed but adjacent, keep going");
+                bug.target = target;
+            } else {
+                // indicate("RETARGET");
+                lastBugPos = lastLoc = secondLastBugPos = secondLastLoc = new MapLocation(-1, -1);
+                lastDist = 0;
+                bug = new BugnavInstance(true, target);
+            }
+        }
+        // int shade = 255;
+        // // Profiler.begin();
+        if(!isRatKing && (lastDist < {{(MAX_PATH / 3) | int}} || RobotTracker.allySet.contains(bug.pos)) || RobotTracker.kingSet.contains(bug.pos)) {
+            bugLoop: {
+                {% for i in range(MAX_BUG_ITERS) %}
+                // rc.setIndicatorDot(bug.pos, 0, Math.max(0, shade -= 30), 0);
+                // // Profiler.begin();
+                if(!bug.advance() || isRatKing || Clock.getBytecodesLeft() < 6500) break bugLoop;
+                lastDist++;
+                // // Profiler.end("bug");
+                {% endfor %}
+            }
+        }
+        // // Profiler.end("bug");
+
+        // deal with the edge case of moving immediately out of sight
+        if(myLoc.equals(bug.pos)) {
+            lastDist = 0;
+            var loc = bug.outOfSightLoc;
+            bug.outOfSightLoc = null;
+            if(loc == null || loc.equals(myLoc)) return Direction.CENTER;
+            var dir = myLoc.directionTo(loc);
+            turn(dir);
+            if(CellTracker.isPassable(loc) && (!CellTracker.isDirt(loc) || Config.allowDirt())) {
+                return dir;
+            }
+        }
+
+        if(!rc.isMovementReady()) return Direction.CENTER;
+
+        if(bug.pos == secondLastBugPos && myLoc.equals(secondLastLoc)) {
+            reps++;
+            if(reps >= 5) {
+                // indicate("stuck, resetting bug");
+                // println("stuck, resetting bug");
+                bug.clearPath();
+                bug.advance();
+                lastBugPos = lastLoc = new MapLocation(-1, -1);
+                lastDist = 0;
+                reps = 0;
+            }
+        } else {
+            reps = 0;
+        }
+        if(!lastLoc.equals(myLoc) || !lastBugPos.equals(bug.pos)) {
+            secondLastBugPos = lastBugPos;
+            secondLastLoc = lastLoc;
+            lastBugPos = bug.pos;
+            lastLoc = myLoc;
+        }
+        // rc.setIndicatorDot(bug.pos, 255, 0, 0);
+
+        // no bfs needed
+        {
+            var dir = myLoc.directionTo(bug.pos);
+            if(myLoc.add(dir).equals(bug.pos)) {
+                if(dir != Direction.CENTER) {
+                    // indicate("adjacent");
+                    return dir;
+                }
+                lastDist = 0;
+                return Direction.CENTER;
+            }
+        }
+
+        return doBugnavBfs(target);
+    }
+
+    {% macro writePos(pos, mask, val, boundsCheck) %}
+    {% set op = "|=" if val else "&= ~" %}
+    {
+        var pos = {{pos}};
+        int xi = pos.x - myLocX + 5;
+        int yi = pos.y - myLocY + 5;
+        {% if boundsCheck %}
+        if(xi >= 0 && xi < 11 && yi >= 0 && yi < 11)
+        {% endif %}
+        {
+            int idx = yi * 11 + xi;
+            if(idx < 61) {
+                {{mask}}0 {{op}} (1l << idx);
+            } else {
+                {{mask}}1 {{op}} (1l << (idx - 61));
+            }
+        }
+    }
+    {% endmacro %}
+
+    {% macro bfsIteration(mask, localPassable) %}
+    // we don't need to worry about the "seam" here because it's at the cell we are standing on
+    {{mask}}0 |= ({{mask}}0 & 0xfbff7feffdffbffl) << 1;
+    {{mask}}1 |= ({{mask}}1 & 0x7feffdffbff7fefl) << 1;
+    {{mask}}0 |= ({{mask}}0 & 0x1f7feffdffbff7fel) >> 1;
+    {{mask}}1 |= ({{mask}}1 & 0xffdffbff7feffdel) >> 1;
+
+    {{mask}}1 |= (({{mask}}1 & 0x1ffffffffffffl) << 11) | ({{mask}}0 >> 50);
+    {{mask}}0 |= ({{mask}}0 & 0x3ffffffffffffl) << 11;
+    {{mask}}0 |= ({{mask}}0 >> 11) | (({{mask}}1 & 0x7ffl) << 50);
+    {{mask}}1 |= {{mask}}1 >> 11;
+    {{mask}}0 &= {{localPassable}}0;
+    {{mask}}1 &= {{localPassable}}1;
+    {% endmacro %}
+
+    private static int catPenalty(MapLocation loc) {
+        // prefer avoiding cat vision range; weight visible cats more heavily
+        int score = 0;
+        for(int i = 0; i < 4; i++) {
+            int penalty, angle;
+            if(i == time % 4) {
+                penalty = 3000;
+                angle = 180;
+            } else {
+                penalty = 1300;
+                angle = 360;
+            }
+            for(int j = RobotTracker.catHistNum[i] - 1; j >= 0; j--) {
+                var cat = RobotTracker.catHist[i][j];
+                if(cat == null) continue;
+                if(cat.location.isWithinDistanceSquared(loc, UnitType.CAT.visionConeRadiusSquared, cat.direction, angle, true)) {
+                    score += penalty;
+                }
+            }
+        }
+        return score;
+    }
+
+    private static long localPassableExceptAllies0, localPassableExceptAllies1;
+    private static long nearCat0, nearCat1;
+    {% for mode in ["bugnav", "source"] %}
+    private static void prepareBfsMasks{{capitalise(mode)}}() throws GameActionException {
+        // Profiler.begin();
+        CellTracker.computeLocalBfsMasks();
+        localPassableExceptAllies0 = CellTracker.localPassable0;
+        localPassableExceptAllies1 = CellTracker.localPassable1;
+        // minkowski sum the walls for the rat king
+        {% macro kingMinkowski() %}
+        if(isRatKing) {
+            localPassableExceptAllies0 &= (localPassableExceptAllies0 & 0xfbff7feffdffbffl) << 1;
+            localPassableExceptAllies1 &= ((localPassableExceptAllies1 & 0x7feffdffbff7fefl) << 1) | 1;
+            localPassableExceptAllies0 &= ((localPassableExceptAllies0 & 0x1f7feffdffbff7fel) >> 1) | 0x1000000000000000l;
+            localPassableExceptAllies1 &= (localPassableExceptAllies1 & 0xffdffbff7feffdel) >> 1;
+
+            localPassableExceptAllies1 &= ((localPassableExceptAllies1 & 0x1ffffffffffffl) << 11) | (localPassableExceptAllies0 >> 50);
+            localPassableExceptAllies0 &= (localPassableExceptAllies0 & 0x3ffffffffffffl) << 11;
+            localPassableExceptAllies0 &= ((localPassableExceptAllies0 >> 11) | ((localPassableExceptAllies1 & 0x7ffl) << 50));
+            localPassableExceptAllies1 &= (localPassableExceptAllies1 >> 11);
+        }
+        {% endmacro %}
+        if(RatKing.is5x5) {
+            {{ kingMinkowski() }}
+        }
+        // can't dig dirt if we don't have enough cheese
+        if(rc.getAllCheese() < GameConstants.DIG_DIRT_CHEESE_COST) {
+            localPassableExceptAllies0 &= ~CellTracker.localDirt0;
+            localPassableExceptAllies1 &= ~CellTracker.localDirt1;
+        }
+        // IF TLE: unroll this (and the one in multisourceBfs)
+        for(int i = RobotTracker.allyCount - 1; i >= 0; i--) {
+            if(isRatKing && RobotTracker.allies[i].isAdjacentTo(myLoc)) {
+                continue;
+            }
+            {{ writePos("RobotTracker.allies[i]", "localPassableExceptAllies", 0, True) }}
+        }
+        {% if mode != "source" %}
+        // IF TLE: definitely optimise this (and the one in multisourceBfs)
+        for(int i = 0; i < 5; i++) {
+            var kingLoc = GlobalArray.getRatKing(i);
+            if(kingLoc == null || kingLoc.equals(myLoc)) continue;
+            {% for dir in allDirections %}
+            {{ writePos("kingLoc.add(%s)" % dir, "localPassableExceptAllies", 0, True) }}
+            {% endfor %}
+        }
+        {% endif %}
+        nearCat0 = nearCat1 = 0;
+        for(int i = 0; i < 4; i++) {
+            catLoop:
+            for(int j = RobotTracker.catHistNum[i] - 1; j >= 0; j--) {
+                var cat = RobotTracker.catHist[i][j];
+                if(cat == null) continue;
+                var catLoc = cat.location;
+                {% set offs = [(-1, 0), (-1, 1), (-1, 2), (0, 2), (1, 2), (2, 2), (2, 1), (2, 0), (2, -1), (1, -1), (0, -1), (-1, -1)] * 2 %}
+                for(int dx = 0; dx <= 1; dx++) {
+                    for(int dy = 0; dy <= 1; dy++) {
+                        var senseLoc = catLoc.translate(dx, dy);
+                        if(canSense(myLoc, senseLoc, myDir)) {
+                            var robot = rc.senseRobotAtLocation(senseLoc);
+                            if(robot != null && robot.location.equals(catLoc) && robot.getType() == UnitType.CAT) {
+                                {% for dx2 in [0, 1] %}
+                                {% for dy2 in [0, 1] %}
+                                {{ writePos("catLoc.translate(%d, %d)" % (dx2, dy2), "localPassableExceptAllies", 0, False) }}
+                                {% endfor %}
+                                {% endfor %}
+                                switch(robot.direction.ordinal()) {
+                                    {% for di in range(8) %}
+                                    case {{di}} -> {
+                                        {% for dx2, dy2 in offs[[0, 1, 3, 4, 6, 7, 9, 10][di]:][:8 + di % 2] %}
+                                        {{ writePos("catLoc.translate(%d, %d)" % (dx2, dy2), "localPassableExceptAllies", 0, True) }}
+                                        // if(rc.onTheMap(catLoc.translate({{dx2}}, {{dy2}}))) rc.setIndicatorDot(catLoc.translate({{dx2}}, {{dy2}}), 100, 0, 255);
+                                        {% endfor %}
+                                    }
+                                    {% endfor %}
+                                }
+                            } else {
+                                // invalidate this entry
+                                RobotTracker.catHist[i][j] = null;
+                            }
+                            continue catLoop;
+                        }
+                    }
+                }
+                // we can't sense this cat, use historical info only
+                {% for dx2 in [0, 1] %}
+                {% for dy2 in [0, 1] %}
+                {{ writePos("catLoc.translate(%d, %d)" % (dx2, dy2), "localPassableExceptAllies", 0, False) }}
+                {% endfor %}
+                {% endfor %}
+                {% for dx2, dy2 in offs %}
+                {{ writePos("catLoc.translate(%d, %d)" % (dx2, dy2), "nearCat", 1, True) }}
+                {% endfor %}
+            }
+        }
+        // minkowski sum the walls for the rat king again (5x5 hitbox for walls, 3x3 hitbox for allies and dirt)
+        {{ kingMinkowski() }}
+        localPassableExceptAllies0 &= ~(1l << 60);
+    }
+
+    {% if mode == "bugnav" %}
+    private static Direction doBugnavBfs(MapLocation target) throws GameActionException
+    {% else %}
+    public static Direction doBfs(MapLocation target) throws GameActionException
+    {% endif %}
+    {
+        prepareBfsMasks{{capitalise(mode)}}();
+        // d{i}0 + d{i}1 is the mask of reachable within i steps
+        long d00 = 0, d01 = 0;
+        long d10 = 0, d11 = 0;
+
+        {% if mode == "source" %}
+        {{ writePos("target", "d0", 1, True) }}
+        {% endif %}
+        boolean lastIteration = false;
+        bfsLoop: {
+            {% for i in range(MAX_PATH) %}
+            {% if mode == "bugnav" %}
+            if(lastIteration) break bfsLoop;
+            {% if i % 2 == 0 %}
+            {
+                var bugPos = bug.getRecentPos({{i}} / 2);
+                if(bugPos.equals(myLoc)) {
+                    // we are completely stuck
+                    break bfsLoop;
+                } else {
+                    {{ writePos("bugPos", "d%s" % i, 1, True) }}
+                }
+                if(bugPos.isAdjacentTo(myLoc) && isRatKing) {
+                    lastIteration = true;
+                }
+            }
+            {% endif %}
+            {% endif %}
+            // if(amAfter(12556, 84)) {
+            //     indicatorString = "";
+            //     CellTracker.printLocalMask(d{{i}}0, d{{i}}1);
+            //     // CellTracker.printLocalMask(localPassableExceptAllies0, localPassableExceptAllies1);
+            //     // CellTracker.printLocalMask(CellTracker.localPassable0, CellTracker.localPassable1);
+            //     Clock.yield();
+            //     // indicatorString = "";
+            //     // CellTracker.printLocalMask(nearCat0, nearCat1);
+            //     // Clock.yield();
+            // }
+            {% if i %}
+            if((d{{i}}0 & 0x807000000000000l) != 0 || (d{{i}}1 & 0xe01) != 0) {
+                // // Profiler.begin();
+                // this is sloppy since we only care about tiles <= 2 chebyshev distance away
+                long notWallAdjacent0 = CellTracker.localPassable0, notWallAdjacent1 = CellTracker.localPassable1;
+                notWallAdjacent1 &= (notWallAdjacent1 << 1) | (notWallAdjacent0 >> 60);
+                notWallAdjacent0 &= notWallAdjacent0 << 1;
+                notWallAdjacent0 &= (notWallAdjacent0 >> 1) | ((notWallAdjacent1 & 1l) << 60);
+                notWallAdjacent1 &= notWallAdjacent1 >> 1;
+                notWallAdjacent1 &= (notWallAdjacent1 << 11) | (notWallAdjacent0 >> 50);
+                notWallAdjacent0 &= notWallAdjacent0 << 11;
+                notWallAdjacent0 &= (notWallAdjacent0 >> 11) | ((notWallAdjacent1 & 0x7ffl) << 50);
+                notWallAdjacent1 &= notWallAdjacent1 >> 11;
+
+                Direction bestMove = null;
+                double bestScore = 1e18;
+                {% for dir, off in [
+                                    ("Direction.SOUTH", 49),
+                                    ("Direction.EAST", 61),
+                                    ("Direction.NORTH", 71),
+                                    ("Direction.WEST", 59),
+                                    ("Direction.SOUTHWEST", 48),
+                                    ("Direction.SOUTHEAST", 50),
+                                    ("Direction.NORTHWEST", 70),
+                                    ("Direction.NORTHEAST", 72),
+                                    ] %}
+                tryMove: {
+                    var nextLoc = myLoc.add({{dir}});
+                    boolean isDirt = false;
+                    if((rc.canMove({{dir}})
+                        || (isDirt = CellTracker.isDirt(nextLoc)) && rc.getAllCheese() >= GameConstants.DIG_DIRT_CHEESE_COST
+                        || isRatKing && CellTracker.isKingPassable(nextLoc))
+                       && (isRatKing || !RobotTracker.kingSet.contains(nextLoc))) {
+                        double score = nextLoc.distanceSquaredTo(target)
+                            {% if mode == "bugnav" %}
+                            + nextLoc.distanceSquaredTo(bug.pos)
+                            {% endif %}
+                            ;
+                        // prefer staying away from walls, this helps when changing direction
+                        if(isRatKing) {
+                            if(CellTracker.isPassable5x5(nextLoc)) {
+                                score -= 100;
+                            }
+                        } else {
+                            if(
+                               {% if off < 61 %}
+                               (notWallAdjacent0 & (1l << {{off}}))
+                               {% else %}
+                               (notWallAdjacent1 & (1l << {{off - 61}}))
+                               {% endif %}
+                               != 0
+                               ) {
+                                score -= 100;
+                            }
+                        }
+                        // prefer getting closer to the target
+                        if(
+                           {% if off < 61 %}
+                           (d{{i}}0 & (1l << {{off}}))
+                           {% else %}
+                           (d{{i}}1 & (1l << {{off - 61}}))
+                           {% endif %}
+                           != 0
+                           ) {
+                            score -= 1200;
+                        } else if(isRatKing) {
+                            break tryMove;
+                        }
+                        // strongly prefer avoiding adjacent squares to historical cat locations
+                        if(
+                           {% if off < 61 %}
+                           (nearCat0 & (1l << {{off}}))
+                           {% else %}
+                           (nearCat1 & (1l << {{off - 61}}))
+                           {% endif %}
+                           != 0
+                           ) {
+                            score += 2700;
+                        }
+                        // prefer definitely empty squares over possibly dirt
+                        if(isDirt) {
+                            score += 1000;
+                        }
+                        // if we can't turn, then prefer moving straight
+                        // however, we still prefer strafing to moving forward into dirt
+                        if(!rc.canTurn() && {{dir}} == myDir) {
+                            score -= 500;
+                        }
+                        score += catPenalty(nextLoc);
+                        // indicate({{dir}} + " " + score);
+                        if(score < bestScore) {
+                            bestMove = {{dir}};
+                            bestScore = score;
+                        }
+                    }
+                }
+                {% endfor %}
+                // // Profiler.end("bfs best move");
+                if(bestMove != null) {
+                    // Profiler.end("bfs");
+                    // indicate("bestMove: " + bestMove);
+                    lastDist = {{i}};
+                    // indicate("bfs iters: " + {{i}});
+                    return bestMove;
+                }
+            }
+            {% endif %}
+
+            // // Profiler.begin();
+
+            {{ bfsIteration("d%s" % i, "localPassableExceptAllies") }}
+            long d{{i + 2}}0 = 0l;
+            long d{{i + 2}}1 = 0l;
+            d{{i + 2}}0 = d{{i}}0;
+            d{{i + 2}}1 = d{{i}}1;
+            d{{i}}0 &= ~CellTracker.localDirt0;
+            d{{i}}1 &= ~CellTracker.localDirt1;
+            d{{i + 1}}0 |= d{{i}}0;
+            d{{i + 1}}1 |= d{{i}}1;
+            // // Profiler.end("bfs iteration");
+            {% endfor %}
+        }
+        // Profiler.end("bfs");
+
+        // println("fallback when bfs can't find path");
+        // indicate("fallback when bfs can't find path");
+
+        {% if mode == "bugnav" %}
+        if(!isRatKing) {
+            // move in a random direction (to make way for any allies blocking us)
+            var dirs = new Direction[8];
+            int dirCount = 0;
+            {% for dir in directions %}
+            if(rc.canMove({{dir}})) dirs[dirCount++] = {{dir}};
+            {% endfor %}
+
+            lastDist = 0;
+            lastBugPos = lastLoc = secondLastBugPos = secondLastLoc = new MapLocation(-1, -1);
+            bug.clearPath();
+
+            if(dirCount > 0) return dirs[Rng.mcg() % dirCount];
+        }
+        {% endif %}
+
+        return Direction.CENTER;
+    }
+    {% endfor %}
+
+    // returns a mask of good directions according to the default order
+    public static int[] multisourceBfs(MapLocation[] sources, int sourceCnt) throws GameActionException {
+        if (sourceCnt == 0) {
+            // println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! MULTISOURCE BFS NO SOURCES !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            return new int[] {0, 1000};
+        }
+        CellTracker.computeLocalBfsMasks();
+        long reach0 = 0, reach1 = 0;
+        for (int i = 0; i < sourceCnt; i++) {
+            {{ writePos("sources[i]", "reach", 1, True) }}
+        }
+        var localPassable0 = CellTracker.localPassable0 & ~CellTracker.localDirt0;
+        var localPassable1 = CellTracker.localPassable1 & ~CellTracker.localDirt1;
+        for(int i = RobotTracker.allyCount - 1; i >= 0; i--) {
+            {{ writePos("RobotTracker.allies[i]", "localPassable", 0, True) }}
+        }
+        for(int i = 0; i < 5; i++) {
+            var kingLoc = GlobalArray.getRatKing(i);
+            if(kingLoc == null) continue;
+            {% for dir in allDirections %}
+            {{ writePos("kingLoc.add(%s)" % dir, "localPassableExceptAllies", 0, True) }}
+            {% endfor %}
+        }
+        {% for i in range(7) %}
+        if((reach0 & 0x807000000000000l) != 0 || (reach1 & 0xe01) != 0) {
+            // indicate("loop {{i}}");
+            int res = 0;
+            {% for b, dir, off in [
+                                   (1, "Direction.NORTH", 71),
+                                   (2, "Direction.NORTHEAST", 72),
+                                   (4, "Direction.EAST", 61),
+                                   (8, "Direction.SOUTHEAST", 50),
+                                   (16, "Direction.SOUTH", 49),
+                                   (32, "Direction.SOUTHWEST", 48),
+                                   (64, "Direction.WEST", 59),
+                                   (128, "Direction.NORTHWEST", 70),
+                                ] %}
+            if(
+               {% if off < 61 %}
+               (reach0 & (1l << {{off}}))
+               {% else %}
+               (reach1 & (1l << {{off - 61}}))
+               {% endif %}
+               != 0) {
+                res |= {{b}};
+            }
+            {% endfor %}
+            return new int[] {res, {{i}}};
+        }
+        {% if i != 6 %}
+        {{ bfsIteration("reach", "localPassable") }}
+        {% endif %}
+        {% endfor %}
+        return new int[] {0, 1000};
+    }
+
+    public static long reach0, reach1;
+    public static void computeReachable() {
+        CellTracker.computeLocalBfsMasks();
+        var localPassable0 = CellTracker.localPassable0;
+        var localPassable1 = CellTracker.localPassable1;
+        for(int i = RobotTracker.allyCount - 1; i >= 0; i--) {
+            var ally = RobotTracker.allies[i];
+            {{ writePos("ally", "localPassable", 0, True) }}
+        }
+        reach0 = 0x807000000000000l & localPassable0;
+        reach1 = 0xe01 & localPassable1;
+        {% for i in range(5) %}
+        // if(amAfter(12903, 468)) {
+        //     indicatorString = "";
+        //     CellTracker.printLocalMask(reach0, reach1);
+        //     Clock.yield();
+        // }
+        {{ bfsIteration("reach", "localPassable") }}
+        {% endfor %}
+    }
+}

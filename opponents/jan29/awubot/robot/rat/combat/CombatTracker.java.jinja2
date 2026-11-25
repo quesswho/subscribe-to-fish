@@ -1,0 +1,462 @@
+package awubot.robot.rat.combat;
+
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+import battlecode.common.MapInfo;
+import battlecode.common.MapLocation;
+import battlecode.common.RobotInfo;
+import battlecode.common.TrapType;
+import battlecode.common.UnitType;
+
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import awubot.util.Profiler;
+import awubot.CellTracker;
+import awubot.RobotTracker;
+import awubot.comms.Enemy;
+import awubot.comms.EnemyManager;
+
+public class CombatTracker {
+    private static final int GRID_RADIUS = 2;
+
+    {% macro cell_var(dx, dy) -%}
+    t_{{ "m" if dx < 0 else "" }}{{ dx|abs }}_{{ "m" if dy < 0 else "" }}{{ dy|abs }}
+    {%- endmacro %}
+
+    {% macro long_hex(val) -%}
+    0x{{ "%016x"|format(val) }}L
+    {%- endmacro %}
+
+    {% macro threat_expr(dx_m, dy_m) -%}
+    {%- set ns = namespace(terms=[]) -%}
+    {%- for i in range(8) -%}
+    {%- set ndir = directions[i] -%}
+    {%- set nx = dx_m + dir_dx[ndir] -%}
+    {%- set ny = dy_m + dir_dy[ndir] -%}
+    {%- set term = "(" ~ cell_var(nx, ny) ~ " ? " ~ long_hex(bitLeftShift(255, i * 8)) ~ " : 0L)" -%}
+    {%- set ns.terms = ns.terms + [term] -%}
+    {%- endfor -%}
+    {%- if ns.terms|length == 0 -%}
+    0L
+    {%- else -%}
+    {{ ns.terms | join(" | ") }}
+    {%- endif -%}
+    {%- endmacro %}
+
+    {% macro enemy_mask(dx_e, dy_e, facing_idx, moveDir) -%}
+    {%- set dx_m = dir_dx[moveDir] -%}
+    {%- set dy_m = dir_dy[moveDir] -%}
+    {%- set dx_rel = dx_m - dx_e -%}
+    {%- set dy_rel = dy_m - dy_e -%}
+    {%- set dist_ok = (dx_rel * dx_rel + dy_rel * dy_rel) <= 20 -%}
+    {%- set ns = namespace(mask=0) -%}
+    {%- set visible = (can_see(facing_idx, dx_rel, dy_rel) == "true") -%}
+    {%- if dist_ok and visible -%}
+    {%- for i in range(8) -%}
+    {%- set ndir = directions[i] -%}
+    {%- set nx = dx_m + dir_dx[ndir] -%}
+    {%- set ny = dy_m + dir_dy[ndir] -%}
+    {%- set adx = (nx - dx_e) | abs -%}
+    {%- set ady = (ny - dy_e) | abs -%}
+    {%- if adx <= 1 and ady <= 1 -%}
+    {%- set ns.mask = bitOr(ns.mask, bitLeftShift(1, i * 8)) -%}
+    {%- endif -%}
+    {%- endfor -%}
+    {%- endif -%}
+    {{ long_hex(ns.mask) }}
+    {%- endmacro %}
+
+    {% macro add_mask(var, dx_e, dy_e, facing_idx, moveDir) -%}
+    {%- set mask = enemy_mask(dx_e, dy_e, facing_idx, moveDir) -%}
+    {%- if mask|trim != "0x0000000000000000L" -%}
+    {{ var }} += {{ mask }};
+    {%- endif -%}
+    {%- endmacro %}
+
+    // isThreat flags for the 5x5 around the player.
+    {% for dy in range(2, -3, -1) %}
+    {% for dx in range(-2, 3) %}
+    private static boolean {{ cell_var(dx, dy) }};
+    {% endfor %}
+    {% endfor %}
+
+    // Byte-packed enemy counters (low/high health) per move direction.
+    {% for s in moveShort %}
+    private static long low{{ s }};
+    {% endfor %}
+    {% for s in moveShort %}
+    private static long high{{ s }};
+    {% endfor %}
+
+    // Byte-packed threat masks per move direction (0xFF per reachable neighbor).
+    {% for s in moveShort %}
+    private static long moveThreat{{ s }};
+    {% endfor %}
+
+    // Cached (combined & threat) per move/facing.
+    {% for ms in moveShort %}
+    {% for fs in shortDirections %}
+    public static long threat{{ ms }}{{ fs }};
+    {% endfor %}
+    {% endfor %}
+
+    // Hidden-neighbor masks per facing (0xFF for hidden, 0x00 for visible).
+    {% for facing in directions %}
+    {%- set ns = namespace(mask=0) -%}
+    {%- for i in range(8) -%}
+    {%- set dir = directions[i] -%}
+    {%- if dir not in visible_dirs[facing] -%}
+    {%- set ns.mask = bitOr(ns.mask, bitLeftShift(255, i * 8)) -%}
+    {%- endif -%}
+    {%- endfor -%}
+    private static final long hidden{{ shortDirections[loop.index0] }} = {{ long_hex(ns.mask) }};
+    {% endfor %}// indicate
+
+    public static void tick() throws GameActionException {
+        // // Profiler.push();
+        loadThreatFromMap();
+        // // Profiler.pop("CombatTracker: loading threats");
+
+        // // Profiler.push();
+        recomputeThreatMasks();
+        // // Profiler.pop("CombatTracker: recomputing threat masks");
+
+        resetEnemyCounts();
+        
+        // // Profiler.push();
+        for (int i = 0; i < RobotTracker.numEnemies; i++) {
+            RobotInfo info = RobotTracker.sortedEnemies[i];
+            if (info.getType() != UnitType.BABY_RAT) continue;
+            registerEnemy(new Enemy(info));
+        }
+        // be aware of squeaked danger (hopefully should reduce chance of getting napped while not blocking too many moves unnecessarily)
+        for (int i = 0; i < EnemyManager.numKnownEnemies; i++) {
+            Enemy enemy = EnemyManager.knownEnemies[i];
+            registerEnemy(enemy);
+        }
+        // // Profiler.pop("CombatTracker: registering enemies");
+
+        // // Profiler.push();
+        precomputeThreatCombos();
+        // // Profiler.pop("CombatTracker: precomputing threat combos");
+    }
+
+    public static void resetEnemyCounts() {
+        {% for s in moveShort %}
+        low{{ s }} = 0L;
+        {% endfor %}
+        {% for s in moveShort %}
+        high{{ s }} = 0L;
+        {% endfor %}
+    }
+
+    private static void precomputeThreatCombos() {
+        {% for mi in range(moveShort|length) %}
+        {
+            long low = low{{ moveShort[mi] }};
+            long high = high{{ moveShort[mi] }};
+            long threat = moveThreat{{ moveShort[mi] }};
+            long combined;
+            {% for fi in range(shortDirections|length) %}
+            combined = high + (low & hidden{{ shortDirections[fi] }});
+            threat{{ moveShort[mi] }}{{ shortDirections[fi] }} = combined & threat;
+            {% endfor %}
+        }
+        {% endfor %}
+    }
+
+    public static boolean hasAnyThreat(Direction moveDir) {
+        switch (moveDir.ordinal()) {
+            {% for mi in range(moveShort|length) %}
+            case {{ mi }} -> {
+                long comb = low{{ moveShort[mi] }} + high{{ moveShort[mi] }};
+                return (comb & moveThreat{{ moveShort[mi] }}) != 0L;
+            }
+            {% endfor %}
+            default -> { return false; }
+        }
+    }
+
+    // TODO: account for dirt
+    public static void loadThreatFromMap() throws GameActionException {
+        int x = myLoc.x;
+        int y = myLoc.y;
+        {% for dy in range(2, -3, -1) %}
+        {% for dx in range(-2, 3) %}
+        {%- if dx == 0 and dy == 0 %}
+        {{ cell_var(dx, dy) }} = true;
+        {%- else %}
+        {%- set ns = namespace(conds=[]) -%}
+        {%- if dx < 0 -%}
+        {%- set ns.conds = ns.conds + ["x >= " ~ (-dx)] -%}
+        {%- elif dx > 0 -%}
+        {%- set ns.conds = ns.conds + ["x < mapWidth - " ~ dx] -%}
+        {%- endif -%}
+        {%- if dy < 0 -%}
+        {%- set ns.conds = ns.conds + ["y >= " ~ (-dy)] -%}
+        {%- elif dy > 0 -%}
+        {%- set ns.conds = ns.conds + ["y < mapHeight - " ~ dy] -%}
+        {%- endif -%}
+        {%- if ns.conds|length > 0 -%}
+        {{ cell_var(dx, dy) }} = ({{ ns.conds | join(" && ") }}) && CellTracker.mapData[y {% if dy %} + {{dy}}{% endif %}].charAt(x {% if dx %} + {{dx}}{% endif %}) != '\2';
+        {%- else -%}
+        {{ cell_var(dx, dy) }} = CellTracker.mapData[y {% if dy %} + {{dy}}{% endif %}].charAt(x {% if dx %} + {{dx}}{% endif %}) != '\2';
+        {%- endif -%}
+        {%- endif %}
+        {% endfor %}
+        {% endfor %}
+    }
+
+    {# public static void registerTrap(int dx, int dy) {
+        switch (dx) {
+            {% for dx in range(-2, 3) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-2, 3) %}
+                    case {{ dy }} -> {
+                        {% for cx in range(-2, 3) %}
+                        {% for cy in range(-2, 3) %}
+                        {% if (cx - dx)|abs <= 1 and (cy - dy)|abs <= 1 %}
+                        {{ cell_var(cx, cy) }} = false;
+                        {% endif %}
+                        {% endfor %}
+                        {% endfor %}
+                    }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    } #}
+
+    public static void recomputeThreatMasks() {
+        {% for i in range(moveDirs|length) %}
+        {%- set moveDir = moveDirs[i] -%}
+        {%- set dx_m = dir_dx[moveDir] -%}
+        {%- set dy_m = dir_dy[moveDir] -%}
+        moveThreat{{ moveShort[i] }} = {{ threat_expr(dx_m, dy_m) }};
+        {% endfor %}
+    }
+
+    public static void registerEnemy(Enemy info) {
+        int dx = info.location.x - myLocX;
+        int dy = info.location.y - myLocY;
+        boolean highHealth = info.health > rc.getHealth();
+        if (highHealth) {
+            registerEnemyHigh(dx, dy, info.direction);
+        } else {
+            registerEnemyLow(dx, dy, info.direction);
+        }
+    }
+
+    public static void registerEnemyLow(int dx, int dy, Direction facing) {
+        switch (dx) {
+            {% for dx in range(-3, 4) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-3, 4) %}
+                    case {{ dy }} -> {
+                        switch (facing.ordinal()) {
+                            {% for fi in range(directions|length) %}
+                            case {{ fi }} -> {
+                                {% for i in range(moveDirs|length) %}
+                                {{ add_mask("low" ~ moveShort[i], dx, dy, fi, moveDirs[i]) }}
+                                {% endfor %}
+                            }
+                            {% endfor %}
+                            default -> { }
+                        }
+                    }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    public static void registerEnemyHigh(int dx, int dy, Direction facing) {
+        switch (dx) {
+            {% for dx in range(-3, 4) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-3, 4) %}
+                    case {{ dy }} -> {
+                        switch (facing.ordinal()) {
+                            {% for fi in range(directions|length) %}
+                            case {{ fi }} -> {
+                                {% for i in range(moveDirs|length) %}
+                                {{ add_mask("high" ~ moveShort[i], dx, dy, fi, moveDirs[i]) }}
+                                {% endfor %}
+                            }
+                            {% endfor %}
+                            default -> { }
+                        }
+                    }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    public static boolean hasThreat(Direction moveDir, Direction facing) {
+        switch (moveDir.ordinal()) {
+            {% for mi in range(moveShort|length) %}
+            case {{ mi }} -> {
+                switch (facing.ordinal()) {
+                    {% for fi in range(shortDirections|length) %}
+                    case {{ fi }} -> { return threat{{ moveShort[mi] }}{{ shortDirections[fi] }} != 0L; }
+                    {% endfor %}
+                    default -> { return false; }
+                }
+            }
+            {% endfor %}
+            default -> { return false; }
+        }
+    }
+
+    public static boolean hasThreat(Direction moveDir, Direction facing, RobotInfo target) {
+        long base;
+        switch (moveDir.ordinal()) {
+            {% for mi in range(moveShort|length) %}
+            case {{ mi }} -> {
+                switch (facing.ordinal()) {
+                    {% for fi in range(shortDirections|length) %}
+                    case {{ fi }} -> { base = threat{{ moveShort[mi] }}{{ shortDirections[fi] }}; }
+                    {% endfor %}
+                    default -> { base = 0L; }
+                }
+            }
+            {% endfor %}
+            default -> { base = 0L; }
+        }
+        if (target == null) return base != 0L;
+        if (target.getTeam() == rc.getTeam()) return base != 0L;
+        if (target.getType() != UnitType.BABY_RAT) return base != 0L;
+        int enemyDx = target.location.x - myLocX;
+        int enemyDy = target.location.y - myLocY;
+        if (enemyDx < -3 || enemyDx > 3 || enemyDy < -3 || enemyDy > 3) return base != 0L;
+        long sub = enemyMaskForMove(enemyDx, enemyDy, target.direction, moveDir);
+        long threat = getMoveThreatMask(moveDir);
+        if (target.getHealth() > rc.getHealth()) {
+            base -= (sub & threat);
+        } else {
+            base -= (sub & getHiddenMask(facing) & threat);
+        }
+        return base != 0L;
+    }
+
+    public static boolean hasThreat(Direction moveDir, Direction facing, RobotInfo target, int damage) {
+        long base;
+        switch (moveDir.ordinal()) {
+            {% for mi in range(moveShort|length) %}
+            case {{ mi }} -> {
+                switch (facing.ordinal()) {
+                    {% for fi in range(shortDirections|length) %}
+                    case {{ fi }} -> { base = threat{{ moveShort[mi] }}{{ shortDirections[fi] }}; }
+                    {% endfor %}
+                    default -> { base = 0L; }
+                }
+            }
+            {% endfor %}
+            default -> { base = 0L; }
+        }
+        if (target == null) return base != 0L;
+        if (target.getTeam() == rc.getTeam()) return base != 0L;
+        if (target.getType() != UnitType.BABY_RAT) return base != 0L;
+        int enemyDx = target.location.x - myLocX;
+        int enemyDy = target.location.y - myLocY;
+        if (enemyDx < -3 || enemyDx > 3 || enemyDy < -3 || enemyDy > 3) return base != 0L;
+        boolean beforeHigh = target.getHealth() > rc.getHealth();
+        boolean afterHigh = (target.getHealth() - damage) > rc.getHealth();
+        if (target.getHealth() <= damage || afterHigh != beforeHigh) {
+            long sub = enemyMaskForMove(enemyDx, enemyDy, target.direction, moveDir);
+            long threat = getMoveThreatMask(moveDir);
+            if (target.getHealth() <= damage) {
+                if (beforeHigh) {
+                    base -= (sub & threat);
+                } else {
+                    base -= (sub & getHiddenMask(facing) & threat);
+                }
+            } else {
+                base -= (sub & threat);
+                base += (sub & getHiddenMask(facing) & threat);
+            }
+        }
+        return base != 0L;
+    }
+
+    private static long getMoveThreatMask(Direction moveDir) {
+        return switch (moveDir.ordinal()) {
+            {% for i in range(moveDirs|length) %}
+            case {{ i }} -> moveThreat{{ moveShort[i] }};
+            {% endfor %}
+            default -> 0L;
+        };
+    }
+
+    private static long getHiddenMask(Direction facing) {
+        return switch (facing.ordinal()) {
+            {% for i in range(directions|length) %}
+            case {{ i }} -> hidden{{ shortDirections[i] }};
+            {% endfor %}
+            default -> 0L;
+        };
+    }
+
+    private static long enemyMaskForMove(int dx, int dy, Direction facing, Direction moveDir) {
+        int faceIdx = facing.ordinal();
+        int moveIdx = moveDir.ordinal();
+        switch (dx) {
+            {% for dx in range(-3, 4) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-3, 4) %}
+                    case {{ dy }} -> {
+                        switch (faceIdx) {
+                            {% for fi in range(directions|length) %}
+                            case {{ fi }} -> {
+                                switch (moveIdx) {
+                                    {% for mi in range(moveDirs|length) %}
+                                    case {{ mi }} -> { return {{ enemy_mask(dx, dy, fi, moveDirs[mi]) }}; }
+                                    {% endfor %}
+                                    default -> { return 0L; }
+                                }
+                            }
+                            {% endfor %}
+                            default -> { return 0L; }
+                        }
+                    }
+                    {% endfor %}
+                    default -> { return 0L; }
+                }
+            }
+            {% endfor %}
+            default -> { return 0L; }
+        }
+    }
+
+    private static boolean isThreatAt(int dx, int dy) {
+        switch (dx) {
+            {% for dx in range(-2, 3) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-2, 3) %}
+                    case {{ dy }} -> { return {{ cell_var(dx, dy) }}; }
+                    {% endfor %}
+                    default -> { return false; }
+                }
+            }
+            {% endfor %}
+            default -> { return false; }
+        }
+    }
+
+    // vision is fully precomputed into enemy masks, no runtime cone checks needed
+}

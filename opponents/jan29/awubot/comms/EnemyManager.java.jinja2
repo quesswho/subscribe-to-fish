@@ -1,0 +1,185 @@
+package awubot.comms;
+
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+
+import awubot.RobotTracker;
+import awubot.util.Rng;
+import awubot.util.string.FastIndexedIntSet;
+import battlecode.common.Direction;
+import battlecode.common.MapLocation;
+
+{% set healths = [24, 26, 28, 30, 32, 34, 36, 38, 40, 42, 44, 46, 48, 50, 52, 54, 56, 58, 60, 62, 64, 66, 68, 70, 72, 74, 76, 78, 80, 88, 90, 100] %}
+
+public class EnemyManager {
+    public static final int LOCATION = 7;
+    public static final int DIRECTION = 3;
+    public static final int HP = 5;
+    public static final int VIEW_RADIUS = 4;
+    public static final int ENC_WIDTH = LOCATION + DIRECTION + HP;
+    public static final int NULL = (1 << ENC_WIDTH) - 1;
+
+    public static FastIndexedIntSet knownEnemiesSet;
+    public static int numKnownEnemies;
+    public static Enemy[] knownEnemies;
+
+    public static void init() {
+        knownEnemiesSet = new FastIndexedIntSet();
+        knownEnemies = new Enemy[100];
+        numKnownEnemies = 0;
+    }
+ 
+    public static void preTick() {
+        knownEnemiesSet.clear();
+        numKnownEnemies = 0;
+    }
+
+    public static void registerPacket(int data, MapLocation src) {
+        Enemy enemy = decodeEnemy(data, src);
+        if (enemy == null) {
+            return;
+        }
+        if (!rc.canSenseLocation(enemy.location) && knownEnemiesSet.add_and_ret(enemy.hashCode())) {
+            // indicate("enemy recv " + enemy.location + " dir " + enemy.direction + " hp " + enemy.health);
+            knownEnemies[numKnownEnemies++] = enemy;
+        }
+    }
+    
+    public static void cullUnsendableEnemies() {
+        int i = 0;
+        while (i < numKnownEnemies) {
+            Enemy enemy = knownEnemies[i];
+            int dx = Math.abs(enemy.location.x - myLocX);
+            int dy = Math.abs(enemy.location.y - myLocY);
+            if (dx > VIEW_RADIUS || dy > VIEW_RADIUS) {
+                // out of range
+                // knownEnemiesSet.remove(encodeEnemy(enemy)); unnecessary
+                knownEnemies[i] = knownEnemies[numKnownEnemies - 1];
+                numKnownEnemies--;
+            } else {
+                i++;
+            }
+        }
+    }
+
+    public static boolean trySqueak() {
+        if (isRatKing) {
+            return trySqueakKing();
+        } else {
+            return trySqueakRat();
+        }
+    }
+
+    public static boolean trySqueakKing() {
+        if (RobotTracker.numEnemies == 0) return false;
+        int data = 0, squeaked = 0;
+        for (int i = 0; i < RobotTracker.numEnemies && squeaked < 2; i++) {
+            Enemy enemy = new Enemy(RobotTracker.sortedEnemies[i]);
+            int dx = Math.abs(enemy.location.x - myLocX);
+            int dy = Math.abs(enemy.location.y - myLocY);
+            if (dx > VIEW_RADIUS || dy > VIEW_RADIUS) continue;
+            data |= (encodeEnemy(enemy) << (i * ENC_WIDTH));
+            squeaked++;
+        }
+        if (squeaked == 1) data |= (NULL << ENC_WIDTH);
+        Squeaker.squeakEnemy(data);
+        return true;
+    }
+
+    public static boolean trySqueakRat() {
+        cullUnsendableEnemies();
+        int squeaked = 0;
+        int data = 0;
+        if (RobotTracker.numEnemies == 1) {
+            Enemy enemy = new Enemy(RobotTracker.sortedEnemies[0]);
+            data |= encodeEnemy(enemy);
+            squeaked++;
+        } else if (RobotTracker.numEnemies > 1) {
+            int i = Rng.mcg() % (RobotTracker.numEnemies - 1) + 1;
+            Enemy enemy = new Enemy(RobotTracker.sortedEnemies[i]);
+            data |= encodeEnemy(enemy);
+            int j = Rng.mcg() % i;
+            enemy = new Enemy(RobotTracker.sortedEnemies[j]);
+            data |= (encodeEnemy(enemy) << ENC_WIDTH);
+            squeaked += 2;
+        }
+        {# if (numKnownEnemies > 1 && squeaked == 0) {
+            int i = Rng.mcg() % (numKnownEnemies - 1) + 1;
+            Enemy enemy = knownEnemies[i];
+            data |= encodeEnemy(enemy);
+            int j = Rng.mcg() % i;
+            enemy = knownEnemies[j];
+            data |= (encodeEnemy(enemy) << ENC_WIDTH);
+            squeaked += 2;
+        } else if (numKnownEnemies > 0 && squeaked == 1) {
+            int i = Rng.mcg() % numKnownEnemies;
+            Enemy enemy = knownEnemies[i];
+            data |= (encodeEnemy(enemy) << ENC_WIDTH);
+            squeaked++;
+        } #}
+        if (squeaked == 0) return false;
+        if (squeaked == 1) data |= (NULL << ENC_WIDTH);
+        Squeaker.squeakEnemy(data);
+        return true;
+    }
+
+    public static int encodeEnemy(Enemy enemy) {
+        int dx = enemy.location.x - myLocX + VIEW_RADIUS;
+        int dy = enemy.location.y - myLocY + VIEW_RADIUS;
+        while (dx < 0) dx++;
+        while (dy < 0) dy++;
+        while (dx > 2 * VIEW_RADIUS) dx--;
+        while (dy > 2 * VIEW_RADIUS) dy--;
+        int encLoc = dx * (2 * VIEW_RADIUS + 1) + dy;
+        if (!(encLoc >= 0 && encLoc < (1 << LOCATION))) {
+            // println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+            // println("ERROR: cannot encode enemy location " + enemy.location + " from " + myLoc + " dx " + dx + " dy " + dy + " encLoc " + encLoc);
+            // println("tried encoding " + enemy.location + " from " + myLoc);
+        }
+        int encDir = enemy.direction.ordinal();
+        int encHP = encodeHealth(enemy.health);
+        assert(encLoc >= 0 && encLoc < (1 << LOCATION)) : "encLoc overflow " + encLoc;
+        assert(encDir >= 0 && encDir < (1 << DIRECTION)) : "encDir overflow " + encDir;
+        assert(encHP >= 0 && encHP < (1 << HP)) : "encHP overflow " + encHP;
+        return (encLoc << (DIRECTION + HP)) | (encDir << HP) | encHP;
+    }
+
+    public static Enemy decodeEnemy(int data, MapLocation src) {
+        if (data == NULL) return null;
+        int encLoc = data >>> (DIRECTION + HP);
+        int encDir = (data >>> HP) & ((1 << DIRECTION) - 1);
+        int encHP = data & ((1 << HP) - 1);
+        assert(encLoc >= 0 && encLoc < (1 << LOCATION)) : "encLoc width " + encLoc;
+        assert(encDir >= 0 && encDir < (1 << DIRECTION)) : "encDir width " + encDir;
+        assert(encHP >= 0 && encHP < (1 << HP)) : "encHP width " + encHP;
+        MapLocation loc = new MapLocation(
+            (encLoc / (2 * VIEW_RADIUS + 1)) - VIEW_RADIUS + src.x,
+            (encLoc % (2 * VIEW_RADIUS + 1)) - VIEW_RADIUS + src.y
+        );
+        return new Enemy(loc, Direction.values()[encDir], decodeHealth(encHP));
+    }
+
+    public static int decodeHealth(int i) {
+        switch (i) {
+            {% for i in range(healths|length) %}
+            case {{ i }}:
+                return {{ healths[i] }};
+            {% endfor %}
+            default: 
+                assert(false) : "Invalid health encoding " + i;
+                return -1;
+        }
+    }
+
+    public static int encodeHealth(int x) {
+        switch (x) {
+            {% for i in range(101) %}
+            case {{ i }}:
+            {% if i in healths %}
+                return {{ healths.index(i) }};
+            {% endif %}
+            {% endfor %}
+            default: return {{ healths|length - 1 }};
+        }
+    }
+}

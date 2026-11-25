@@ -1,0 +1,11 @@
+# test state: built bots and the game cache
+.fish/
+# engine and Gradle builds
+engine/build/
+build/
+.gradle/
+*.class
+__pycache__/
+# official client and replays
+client/
+matches/

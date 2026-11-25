@@ -1,0 +1,74 @@
+package awubot.robot.rat.combat;
+
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import awubot.util.Profiler;
+
+public final class CombatCommon {
+    private CombatCommon() {
+    }
+
+    {% set move_dirs = directions + ['Direction.CENTER'] %}
+    {% set move_short = shortDirections + ['C'] %}
+
+    {% for idx in range(move_dirs|length) %}
+    public static boolean canMove{{ move_short[idx] }};
+    {% endfor %}
+
+    public static void precomp() throws GameActionException {
+        {% for idx in range(move_dirs|length) %}
+        {% if move_dirs[idx] == 'Direction.CENTER' %}
+        canMove{{ move_short[idx] }} = true;
+        {% else %}
+        canMove{{ move_short[idx] }} = rc.canMove({{ move_dirs[idx] }});
+        {% endif %}
+        {% endfor %}
+    }
+
+    public static boolean canMove(Direction dir) {
+        // if (dir == null) return false;
+        return switch (dir.ordinal()) {
+            {% for idx in range(move_dirs|length) %}
+            case {{ idx }} -> canMove{{ move_short[idx] }};
+            {% endfor %}
+            default -> false;
+        };
+    }
+    
+    // TODO: tune
+    public static int strafeCost() {
+        return (rc.getMovementCooldownTurns() < 2 ? 3 : 8);
+    }
+
+    {# public static boolean canPerformMoves(Direction moveDir, Direction facing) {
+        return computeCanPerform(moveDir, facing);
+    }
+
+    private static boolean computeCanPerform(Direction moveDir, Direction facing) {
+        if (moveDir == Direction.CENTER) {
+            if (facing == myDir || rc.canTurn()) return true;
+            else return false;
+        }
+        if (!rc.isMovementReady() || !canMove(moveDir)) return false;
+        if (facing != myDir && !rc.canTurn()) return false;
+        if (moveDir == myDir && myDir == facing) return true; 
+        if ((moveDir == myDir || moveDir == facing)) return true;
+        return true;
+    } #}
+
+    // -1 = impossible, 0 = strafe, 1 = no strafe
+    public static int movementCost(Direction moveDir, Direction facing) {
+        if (moveDir == Direction.CENTER) {
+            if (facing == myDir || rc.canTurn()) return 1;
+            else return -1;
+        }
+        if (!rc.isMovementReady() || !canMove(moveDir)) return -1;
+        if (facing != myDir && !rc.canTurn()) return -1;
+        if (moveDir == myDir && myDir == facing) return 1; 
+        if ((moveDir == myDir || moveDir == facing)) return 1;
+        return 0;
+    }
+}

@@ -1,0 +1,580 @@
+package awubot.robot.rat.combat.moves;
+
+import battlecode.common.Clock;
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+import battlecode.common.MapInfo;
+import battlecode.common.MapLocation;
+import battlecode.common.RobotInfo;
+import battlecode.common.TrapType;
+import battlecode.common.UnitType;
+
+import awubot.robot.rat.combat.CombatCommon;
+import awubot.robot.rat.combat.CombatStrategy;
+import awubot.robot.rat.combat.CombatTracker;
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import static awubot.robot.rat.BabyRat.*;
+import awubot.util.Profiler;
+import awubot.CellTracker;
+import awubot.RobotTracker;
+{% macro wvar(dx, dy) -%}
+w_{{ "m" if dx < 0 else "" }}{{ dx|abs }}_{{ "m" if dy < 0 else "" }}{{ dy|abs }}
+{%- endmacro %}
+
+{% macro delta_dir_ord(dx, dy) -%}
+{%- if dx == 0 and dy == 1 -%}0
+{%- elif dx == 1 and dy == 1 -%}1
+{%- elif dx == 1 and dy == 0 -%}2
+{%- elif dx == 1 and dy == -1 -%}3
+{%- elif dx == 0 and dy == -1 -%}4
+{%- elif dx == -1 and dy == -1 -%}5
+{%- elif dx == -1 and dy == 0 -%}6
+{%- elif dx == -1 and dy == 1 -%}7
+{%- else -%}-1
+{%- endif -%}
+{%- endmacro %}
+
+public final class TryTrap {
+    private TryTrap() {
+    }
+
+    static boolean confirmedCanPlace;
+    {% for dy in range(2, -3, -1) %}
+    {% for dx in range(-2, 3) %}
+    static double {{ wvar(dx, dy) }};
+    {% endfor %}
+    {% endfor %}
+    static MapLocation bestPlaceLoc;
+    static Direction bestMoveDir;
+    static Direction bestSecondaryMoveDir;
+    static Direction bestFacing;
+    static double best;
+    static MapLocation curMoveLoc;
+    static MapLocation weightSource;
+    static int weightCompTime;
+    static int bytecodeStart, bytecodeBudget;
+    static boolean shouldDefRun;
+
+    public static boolean verifyCanRun() throws GameActionException {
+        if (!rc.isActionReady() || !confirmCanPlace()) return false;
+        return true;
+    }
+
+    public static boolean globalShouldRun() throws GameActionException {
+        // global
+        if (rc.getCurrentRatCost() >= 50 || rc.getRawCheese() >= 20) return true;
+        return false;
+    }
+
+    public static boolean shouldTrap(RobotInfo info) throws GameActionException {
+        if (info.getHealth() >= 80 && info.getHealth() >= rc.getHealth() + CombatStrategy.getBiteDamage() || info.getHealth() == 100) {
+            return true;
+        }
+        return false;
+    }
+
+    public static boolean shouldRunEarlyExit() throws GameActionException {
+        // Before round 400 a trap for a strong enemy is paid from the bank only while it holds 600: early, a
+        // trap-heavy opponent out-trades us and the bank decides the fights; later, traps pay.
+        if (rc.getRoundNum() < 400 && rc.getGlobalCheese() < 600) return false;
+        for (int i = 0; i < RobotTracker.numEnemies && i < 3; i++) {
+            RobotInfo info = RobotTracker.sortedEnemies[i];
+            if (info.getType() != UnitType.BABY_RAT) continue;
+            if (shouldTrap(info)) return true;
+        }
+        return false;
+    }
+
+    public static boolean run() throws GameActionException {
+        if (!verifyCanRun()) return false;
+        shouldDefRun = globalShouldRun();
+        if (!shouldDefRun && !shouldRunEarlyExit() && bandTarget() == null) return false;
+
+        bytecodeStart = Clock.getBytecodeNum();
+        bytecodeBudget = Math.min(5000, (int) (Clock.getBytecodesLeft() - 1000) / 2);
+        computeWeights();
+        resetBest();
+        selectMoves();
+        if (best <= 0.5) return false;
+        if (bestMoveDir != null) {
+            assert(CombatStrategy.performMoves(bestMoveDir, bestFacing));
+            rc.placeRatTrap(bestPlaceLoc);
+        } else {
+            rc.placeRatTrap(bestPlaceLoc);
+            assert(CombatStrategy.performMoves(bestSecondaryMoveDir, bestFacing));
+        }
+        return true;
+    }
+
+    private static boolean confirmCanPlace() throws GameActionException {
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% for d in related_map[ord] %}
+                if (rc.canPlaceRatTrap(myLoc.add({{ d }}))) {
+                    return true;
+                }
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+        return false;
+    }
+
+    // has room for optimisation if reallllyyy needed
+    private static void computeWeights() throws GameActionException {
+        {# // Profiler.push(); #}
+        weightCompTime = time;
+        weightSource = myLoc;
+        {% for dy in range(2, -3, -1) %}
+        {% for dx in range(-2, 3) %}
+        {
+            MapLocation loc = new MapLocation(myLocX {% if dx %} + {{ dx }}{% endif %}, myLocY {% if dy %} + {{ dy }}{% endif %});
+            if (!rc.canSenseLocation(loc)) {
+                {{ wvar(dx, dy) }} = -1000;
+            } else {
+                MapInfo info = rc.senseMapInfo(loc);
+                if (!info.isPassable() || info.hasCheeseMine(){% if dx != 0 or dy != 0 %} || rc.senseRobotAtLocation(loc) != null{% endif %}) {
+                    {{ wvar(dx, dy) }} = -1000;
+                } else {
+                    {{ wvar(dx, dy) }} = 0;
+                }
+            }
+        }
+        {% endfor %}
+        {% endfor %}
+
+        applyTrapWeights();
+        applyEnemyWeights();
+        applyBandWeights();
+
+        {# // Profiler.pop("TryTrap.computeWeights"); #}
+    }
+
+    private static void clearWeights() {
+        {% for dy in range(2, -3, -1) %}
+        {% for dx in range(-2, 3) %}
+        {{ wvar(dx, dy) }} = 0;
+        {% endfor %}
+        {% endfor %}
+    }
+
+    // The approach band: an enemy rat two steps away must cross the tile between us next turn to bite or grab, so a
+    // trap there (or 45 degrees off it) catches it first. Paid only when the economy can carry it: enough mines known
+    // and the cheese on hand or in the bank.
+    static final int BAND_MIN_MINES = 5, BAND_RAW = 20, BAND_GLOBAL = 400;
+    static final double BAND_W = 20, BAND_SIDE_W = 10;
+
+    static RobotInfo bandTarget() {
+        if (awubot.Game.knownCheeseMines.size() < BAND_MIN_MINES) return null;
+        if (rc.getRawCheese() < BAND_RAW && rc.getGlobalCheese() < BAND_GLOBAL) return null;
+        for (int i = 0; i < RobotTracker.numEnemies; i++) {
+            RobotInfo e = RobotTracker.sortedEnemies[i];
+            if (e.getType() != UnitType.BABY_RAT) continue;
+            int dx = e.location.x - myLocX, dy = e.location.y - myLocY;
+            int d = Math.max(Math.abs(dx), Math.abs(dy));
+            return d == 2 ? e : null;  // the nearest enemy rat only
+        }
+        return null;
+    }
+
+    private static void addWeight(int dx, int dy, double v) {
+        switch (dx) {
+            case -2 -> {
+                switch (dy) {
+                    case -2 -> w_m2_m2 += v;
+                    case -1 -> w_m2_m1 += v;
+                    case 0 -> w_m2_0 += v;
+                    case 1 -> w_m2_1 += v;
+                    case 2 -> w_m2_2 += v;
+                    default -> { }
+                }
+            }
+            case -1 -> {
+                switch (dy) {
+                    case -2 -> w_m1_m2 += v;
+                    case -1 -> w_m1_m1 += v;
+                    case 0 -> w_m1_0 += v;
+                    case 1 -> w_m1_1 += v;
+                    case 2 -> w_m1_2 += v;
+                    default -> { }
+                }
+            }
+            case 0 -> {
+                switch (dy) {
+                    case -2 -> w_0_m2 += v;
+                    case -1 -> w_0_m1 += v;
+                    case 0 -> w_0_0 += v;
+                    case 1 -> w_0_1 += v;
+                    case 2 -> w_0_2 += v;
+                    default -> { }
+                }
+            }
+            case 1 -> {
+                switch (dy) {
+                    case -2 -> w_1_m2 += v;
+                    case -1 -> w_1_m1 += v;
+                    case 0 -> w_1_0 += v;
+                    case 1 -> w_1_1 += v;
+                    case 2 -> w_1_2 += v;
+                    default -> { }
+                }
+            }
+            case 2 -> {
+                switch (dy) {
+                    case -2 -> w_2_m2 += v;
+                    case -1 -> w_2_m1 += v;
+                    case 0 -> w_2_0 += v;
+                    case 1 -> w_2_1 += v;
+                    case 2 -> w_2_2 += v;
+                    default -> { }
+                }
+            }
+            default -> { }
+        }
+    }
+
+    private static void applyBandWeights() {
+        RobotInfo e = bandTarget();
+        if (e == null) return;
+        Direction d = myLoc.directionTo(e.location);
+        addWeight(d.dx, d.dy, BAND_W);
+        Direction l = d.rotateLeft(), r = d.rotateRight();
+        addWeight(l.dx, l.dy, BAND_SIDE_W);
+        addWeight(r.dx, r.dy, BAND_SIDE_W);
+    }
+
+    private static void applyEnemyWeights() throws GameActionException {
+        for (int i = 0; i < RobotTracker.numEnemies && i < 5; i++) {
+            RobotInfo info = RobotTracker.sortedEnemies[i];
+            if (info.getType() != UnitType.BABY_RAT) continue;
+            applyEnemyWeight(info);
+        }
+    }
+
+    private static double getWeight(int dx, int dy) {
+        switch (dx) {
+            {% for dx_case in range(-2, 3) %}
+            case {{ dx_case }} -> {
+                switch (dy) {
+                    {% for dy_case in range(-2, 3) %}
+                    case {{ dy_case }} -> {
+                        return {{ wvar(dx_case, dy_case) }};
+                    }
+                    {% endfor %}
+                    default -> { return -1000; }
+                }
+            }
+            {% endfor %}
+            default -> { return -1000; }
+        }
+    }
+
+    private static void applyEnemyWeight(RobotInfo rinfo) throws GameActionException {
+        double mult = 1.0;
+        if (!shouldDefRun && !shouldTrap(rinfo)) {
+            mult = -1.0;
+        }
+        int x = rinfo.location.x - myLocX;
+        int y = rinfo.location.y - myLocY;
+        switch (x) {
+            {% for dx in range(-3, 4) %}
+            case {{ dx }} -> {
+                switch (y) {
+                    {% for dy in range(-3, 4) %}
+                    case {{ dy }} -> {
+                        switch (rinfo.direction.ordinal()) {
+                            {% for f in range(8) %}
+
+                            case {{ f }} -> {
+                                {% if can_see(f, -dx, -dy) == "true" %}
+
+                                {% for cx in range(-2, 3) %}
+                                {% for cy in range(-2, 3) %}
+                                {%- set dxo = cx - dx -%}
+                                {%- set dyo = cy - dy -%}
+                                {%- if dxo*dxo + dyo*dyo <= 2 and not (dxo == 0 and dyo == 0) -%}
+                                {%- set dord = delta_dir_ord(dxo, dyo) | int -%}
+                                {%- set diff = (f - dord) | abs -%}
+                                {%- set ang = diff if diff < 8 - diff else 8 - diff -%}
+                                {%- if ang <= 1 -%}
+                                {{ wvar(cx, cy) }} += ({{ 3 - ang }}) * mult;
+                                {# println("incremented weight at " + (myLocX + {{cx}}) + ", " + (myLocY + {{cy}})); #}
+                                {%- endif -%}
+                                {%- endif -%}
+                                {% endfor %}
+                                {% endfor %}
+
+                                {%- endif -%}
+                            }
+                            {% endfor %}
+                            default -> { }
+                        }
+                    }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    public static MapLocation nearbyRatTraps[] = new MapLocation[30];
+    public static int numNearbyRatTraps = 0;
+
+    private static void applyTrapWeights() {
+        numNearbyRatTraps = 0;
+        for (MapInfo info : rc.senseNearbyMapInfos()) {
+            if (info.getTrap() == TrapType.RAT_TRAP) {
+                nearbyRatTraps[numNearbyRatTraps++] = info.getMapLocation();
+            }
+        } 
+        switch (numNearbyRatTraps) {
+            {% for i in range(29, 0, -1) %}
+            case {{ i }}: {
+                MapLocation trapLoc = nearbyRatTraps[{{ i - 1 }}];
+                int x = trapLoc.x - myLocX;
+                int y = trapLoc.y - myLocY;
+                applyTrapWeight(x, y);
+            } 
+            {% endfor %}
+            case 0:
+                break;
+            default:
+                assert(false);
+                break;
+        }
+    }
+
+    private static void applyTrapWeight(int x, int y) {
+        switch (x) {
+            {% for dx in range(-2, 3) %}
+            case {{ dx }} -> {
+                switch (y) {
+                    {% for dy in range(-2, 3) %}
+                    case {{ dy }} -> {
+                        {% for nx in range(dx - 1, dx + 2) %}
+                        {% for ny in range(dy - 1, dy + 2) %}
+                        {%- if nx >= -2 and nx <= 2 and ny >= -2 and ny <= 2 -%}
+                        {# println("marked cell at " + x + ", " + y + " due to trap at " + x + ", " + y); #}
+                        {{ wvar(nx, ny) }} -= 100;
+                        {%- endif -%}
+                        {% endfor %}
+                        {% endfor %}
+                    }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    private static void resetBest() {
+        bestPlaceLoc = null;
+        bestMoveDir = null;
+        bestSecondaryMoveDir = null;
+        bestFacing = null;
+        best = -1;
+    }
+
+    private static void selectMoves() throws GameActionException {
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set facing = directions[ord] %}
+                {% set ordered_dirs = get_movements(facing) %}
+                {% for move_dir, is_wide_related in ordered_dirs %}
+                    {% if is_wide_related %}
+                        move{{ dir_short_map[move_dir] }}();
+                        if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                    {% else %}
+                    {% for facing_dir in related_map[ord] %}
+                        considerSecondaryMove({{ move_dir }}, {{ facing_dir }});
+                        if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                    {% endfor %}
+                    {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    private static void considerSecondaryMove(Direction moveDir, Direction facing) throws GameActionException {
+        int moveCost = CombatCommon.movementCost(moveDir, facing);
+        if (moveCost == -1) return;
+        double moveScore = CombatStrategy.getCellScoreFor(moveDir, facing);
+        if (moveScore <= -100) return;
+        switch (facing.ordinal()) {
+            {% for f in range(8) %}
+            case {{ f }} -> {
+                {% for place_dir in related_map[f] %}
+                if (moveDir != {{ place_dir }}) {
+                    double score = {{ wvar(dir_dx[place_dir], dir_dy[place_dir]) }};
+                    if (score >= 0) {
+                        if (moveCost == 0) score -= CombatCommon.strafeCost();
+                        score += moveScore;
+                        if (facing != myDir) score *= 1.1;
+                        if (score > best) {
+                            best = score;
+                            bestPlaceLoc = myLoc.add({{ place_dir }});
+                            bestMoveDir = null;
+                            bestSecondaryMoveDir = moveDir;
+                            bestFacing = facing;
+                        }
+                    }
+                }
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% for move_dir in allDirections %}
+    {% if move_dir == 'Direction.CENTER' %}
+    // Trapping from where we stand, facing any way we may turn to (the three tiles in front of that facing).
+    private static void moveC() throws GameActionException {
+        if (!CombatCommon.canMoveC) return;
+        curMoveLoc = myLoc;
+        stayFace(Direction.NORTH, CombatTracker.threatCN);
+        stayFace(Direction.NORTHEAST, CombatTracker.threatCNE);
+        stayFace(Direction.EAST, CombatTracker.threatCE);
+        stayFace(Direction.SOUTHEAST, CombatTracker.threatCSE);
+        stayFace(Direction.SOUTH, CombatTracker.threatCS);
+        stayFace(Direction.SOUTHWEST, CombatTracker.threatCSW);
+        stayFace(Direction.WEST, CombatTracker.threatCW);
+        stayFace(Direction.NORTHWEST, CombatTracker.threatCNW);
+    }
+
+    private static void stayFace(Direction face, long threat) {
+        if (threat != 0L) return;
+        if (CombatCommon.movementCost(Direction.CENTER, face) == -1) return;
+        stayPlace(face, face);
+        stayPlace(face, face.rotateLeft());
+        stayPlace(face, face.rotateRight());
+    }
+
+    private static void stayPlace(Direction face, Direction at) {
+        double score = getWeight(at.dx, at.dy);
+        if (score < 0) return;
+        if (face != myDir) score *= 1.1;
+        if (score > best) {
+            best = score;
+            bestPlaceLoc = myLoc.add(at);
+            bestMoveDir = Direction.CENTER;
+            bestSecondaryMoveDir = null;
+            bestFacing = face;
+        }
+    }
+    {% else %}
+    private static void move{{ dir_short_map[move_dir] }}() throws GameActionException {
+        if (!CombatCommon.canMove{{ dir_short_map[move_dir] }}) return;
+        curMoveLoc = myLoc.add({{ move_dir }});
+        {% for facing in related_map[dir_ord_map[move_dir]] %}
+        face{{ dir_short_map[facing] }}{{ dir_short_map[move_dir] }}();
+        if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+        {% endfor %}
+    }
+    {% endif %}
+
+    {% for facing in related_map[dir_ord_map[move_dir]] %}
+    private static void face{{ dir_short_map[facing] }}{{ dir_short_map[move_dir] }}() throws GameActionException {
+        if (CombatTracker.threat{{ dir_short_map[move_dir] }}{{ dir_short_map[facing] }} != 0L) return;
+        int moveCost = CombatCommon.movementCost({{ move_dir }}, {{ facing }});
+        if (moveCost == -1) return;
+        {% for place_dir in related_map[dir_ord_map[facing]] %}
+        place{{ dir_short_map[place_dir] }}{{ dir_short_map[facing] }}{{ dir_short_map[move_dir] }}();
+        {% endfor %}
+    }
+
+    {% for place_dir in related_map[dir_ord_map[facing]] %}
+    {%- set dx_total = dir_dx[move_dir] + dir_dx[place_dir] -%}
+    {%- set dy_total = dir_dy[move_dir] + dir_dy[place_dir] -%}
+    private static void place{{ dir_short_map[place_dir] }}{{ dir_short_map[facing] }}{{ dir_short_map[move_dir] }}() {
+        if ({{ wvar(dx_total, dy_total) }} >= 0) {
+            double score = {{ wvar(dx_total, dy_total) }};
+            if ({{ facing }} != myDir) score *= 1.1;
+            if (score > best) {
+                best = score;
+                bestPlaceLoc = curMoveLoc.add({{ place_dir }});
+                bestMoveDir = {{ move_dir }};
+                bestSecondaryMoveDir = null;
+                bestFacing = {{ facing }};
+            }
+        }
+    }
+    {% endfor %}
+    {% endfor %}
+    {% endfor %}
+
+    
+    public static boolean miniRun() throws GameActionException {
+        if (!verifyCanRun()) return false;
+        shouldDefRun = globalShouldRun();
+        if (weightCompTime != time) {
+            clearWeights();
+            weightSource = myLoc;
+        }
+        int x = myLocX;
+        int y = myLocY;
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set cand = related_map[ord] %}
+                {% for d in cand %}
+                MapLocation loc{{ loop.index0 }} = new MapLocation(x {% if dir_dx[d] %} + {{ dir_dx[d] }}{% endif %}, y {% if dir_dy[d] %} + {{ dir_dy[d] }}{% endif %});
+                double s{{ loop.index0 }} = getWeight(loc{{ loop.index0 }}.x - weightSource.x, loc{{ loop.index0 }}.y - weightSource.y);
+                {% endfor %}
+                for (int i = 0; i < RobotTracker.numEnemies && i < 2; i++) {
+                    RobotInfo rinfo = RobotTracker.sortedEnemies[i];
+                    if (!shouldDefRun && !shouldTrap(rinfo)) continue;
+                    if (rinfo.location.distanceSquaredTo(myLoc) > 2) break;
+                    MapLocation eloc = rinfo.location;
+                    {
+                        if (eloc.distanceSquaredTo(loc0) <= 2) {
+                            int ang = angleDistance(rinfo.direction, eloc.directionTo(loc0));
+                            if (ang <= 3) s0 += 4 - ang;
+                        }
+                    }
+                    {
+                        if (eloc.distanceSquaredTo(loc1) <= 2) {
+                            int ang = angleDistance(rinfo.direction, eloc.directionTo(loc1));
+                            if (ang <= 3) s1 += 4 - ang;
+                        }
+                    }
+                    {
+                        if (eloc.distanceSquaredTo(loc2) <= 2) {
+                            int ang = angleDistance(rinfo.direction, eloc.directionTo(loc2));
+                            if (ang <= 3) s2 += 4 - ang;
+                        }
+                    }
+                }
+                double bestScore = -1;
+                MapLocation bestLoc = null;
+                if (rc.canPlaceRatTrap(loc0) && s0 > bestScore) {
+                    bestScore = s0;
+                    bestLoc = loc0;
+                }
+                if (rc.canPlaceRatTrap(loc1) && s1 > bestScore) {
+                    bestScore = s1;
+                    bestLoc = loc1;
+                }
+                if (rc.canPlaceRatTrap(loc2) && s2 > bestScore) {
+                    bestScore = s2;
+                    bestLoc = loc2;
+                }
+                if (bestScore <= 0) return false;
+                rc.placeRatTrap(bestLoc);
+                return true;
+            }
+            {% endfor %}    
+            default -> { return false; }
+        }
+    }
+}

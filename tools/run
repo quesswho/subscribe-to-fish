@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Plays one game on fish and prints the result.
+
+  tools/run                              working tree vs itself on DefaultSmall, seed 0
+  tools/run wt HEAD~3 --map rift --seed 7
+  tools/run wt v2 --map testmaps/gen/x.map26 --out /tmp/game   bot output in /tmp/game/{a,b}.txt
+  tools/run wt wt --map rift --trace     per-round state hash on stderr (tools/verify compares these)
+
+The same game on the official engine, with a replay for the client: tools/replay (same arguments).
+"""
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("a", nargs="?", default="wt")
+    ap.add_argument("b", nargs="?", default="wt")
+    ap.add_argument("--map", default="DefaultSmall")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--out", help="folder for the teams' System.out (a.txt, b.txt)")
+    ap.add_argument("--trace", action="store_true")
+    ap.add_argument("--timeline", type=int, default=0, metavar="N", help="print both teams' state every N rounds")
+    args = ap.parse_args()
+    F.build_engine()
+    a, b = F.build_bot(args.a), F.build_bot(args.b)
+    cmd = [str(F.FISH), "run", str(F.map_path(args.map)), "--a", a.spec, "--b", b.spec, "--seed", str(args.seed)]
+    if args.out:
+        out = Path(args.out)
+        out.mkdir(parents=True, exist_ok=True)
+        for team in "ab":
+            (out / f"{team}.txt").write_text("")
+        cmd += ["--out-a", str(out / "a.txt"), "--out-b", str(out / "b.txt")]
+    if args.trace:
+        cmd.append("--trace")
+    if args.timeline:
+        cmd += ["--timeline", str(args.timeline)]
+    with F.slot():
+        r = subprocess.run(cmd, stdout=subprocess.PIPE, text=True, env=F.fish_env())
+    try:
+        res = json.loads(r.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        print(r.stdout)
+        return 3
+    if "error" in res and "winner" not in res:
+        print(f"error: {res['error']}")
+        return 3
+    names = {"A": f"A {args.a}", "B": f"B {args.b}", None: "nobody"}
+    print(f"{res['map']} seed {res['seed']}: {names[res['winner']]} wins in round {res['round']} ({res['reason']}), "
+          f"{res['seconds']:.1f}s")
+    print(f"  kings {res['kings']}  cheese {res['cheese']}  transferred {res['transferred']}  "
+          f"cat damage {res['catDamage']}  points {res['points']}")
+    if res.get("timeline"):
+        print(f"  {'round':>5} | {'A: rats kings cheese kinghp moved catdmg traps':<44}| B: rats kings cheese kinghp moved catdmg traps")
+        for row in res["timeline"]:
+            w = (len(row) - 1) // 2
+            a, b = row[1:1 + w], row[1 + w:1 + 2 * w]
+            fmt = lambda t: " ".join(f"{v:6d}" for v in t)
+            print(f"  {row[0]:5d} | {fmt(a):<44}| {fmt(b)}")
+    if "turns" in res:
+        print(f"  turns {res['turns']}  out of bytecode {res['overruns']}  bytecodes per turn {[b // max(1, t) for b, t in zip(res.get('bytecodes', [0, 0]), res['turns'])]}")
+    if any(res["exceptions"]):
+        print(f"  uncaught bot exceptions {res['exceptions']}" + (f" (see {args.out})" if args.out else ""))
+    if "error" in res:
+        print(f"  engine error: {res['error']}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

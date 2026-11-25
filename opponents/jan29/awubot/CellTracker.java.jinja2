@@ -1,0 +1,546 @@
+package awubot;
+
+import battlecode.common.*;
+
+import awubot.util.Profiler;
+import awubot.comms.Squeaker;
+import static awubot.util.Util.*;
+import static awubot.Game.*;
+import awubot.robot.king.RatKing;
+
+public class CellTracker {
+    /*
+
+    '\0' - unknown
+    '\1' - passable
+    '\2' - wall
+    mapdata[y coordinate][x coordinate] for cell info!!
+
+    */
+    public static StringBuilder[] mapData;
+
+    public static void init() {
+        mapData = new StringBuilder[60];
+        for(int i = 0; i < 60; i++) {
+            mapData[i] = new StringBuilder();
+            mapData[i].repeat('\0', 60);
+        }
+        switch(mapHeight) {
+            {% for i in range(20, 60) %}
+            case {{i}}:
+                seen{{i}} = 0xffffffffffffffffl;
+            {% endfor %}
+        }
+    }
+
+    public static void preTick() {
+    }
+
+    {% for mask in ["seen", "passable", "dirt"] %}
+    {% for i in range(MAX_MAP_SIZE) %}
+    static long {{mask}}{{i}};
+    {% endfor %}
+    public static boolean is{{capitalise(mask)}}(MapLocation loc) {
+        {% if mask == "seen" %}
+        if(!rc.onTheMap(loc)) return true;
+        {% endif %}
+        switch(loc.y) {
+            {% for i in range(MAX_MAP_SIZE) %}
+            case {{i}} -> {
+                return ({{mask}}{{i}} & (1l << loc.x)) != 0;
+            }
+            {% endfor %}
+            default -> {
+                return false;
+            }
+        }
+    }
+    public static boolean is{{capitalise(mask)}}(int x, int y) {
+        {% if mask == "seen" %}
+        if (x < 0 || x >= mapWidth) return true;
+        {% endif %}
+        switch(y) {
+            {% for i in range(MAX_MAP_SIZE) %}
+            case {{i}} -> {
+                return ({{mask}}{{i}} & (1l << x)) != 0;
+            }
+            {% endfor %}
+            default -> {
+                {% if mask == "seen" %}
+                return true;
+                {% else %}
+                return false;
+                {% endif %}
+            }
+        }
+    }
+    {% endfor %}
+
+    public static boolean isWallAdjacent(MapLocation loc) {
+        if(loc.y == mapHeight - 1 || loc.x == 0 || loc.x == mapWidth - 1) return true;
+        switch(loc.y) {
+            case 0 -> {
+                return true;
+            }
+            {% for i in range(1, MAX_MAP_SIZE - 1) %}
+            case {{i}} -> {
+                var adjRowMask = 1l << loc.x;
+                return ((seen{{i}} & ~passable{{i}} & (7l << (loc.x - 1)))
+                        | adjRowMask & ((seen{{i - 1}} & ~passable{{i - 1}})
+                                        | (seen{{i + 1}} & ~passable{{i + 1}}))) != 0;
+            }
+            {% endfor %}
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    public static boolean isPassable5x5(MapLocation loc) {
+        if(loc.y >= mapHeight - 2 || loc.x < 2 || loc.x >= mapWidth - 2) return false;
+        switch(loc.y) {
+            {% for i in range(2, MAX_MAP_SIZE - 2) %}
+            case {{i}} -> {
+                var rowMask = 0x1fl << (loc.x - 2);
+                return (rowMask
+                        & passable{{i}}
+                        & passable{{i - 1}}
+                        & passable{{i + 1}}
+                        & passable{{i - 2}}
+                        & passable{{i + 2}}) == rowMask;
+            }
+            {% endfor %}
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    public static boolean isPassable3x3(MapLocation loc) {
+        if(loc.y >= mapHeight - 1 || loc.x < 1 || loc.x >= mapWidth - 1) return false;
+        switch(loc.y) {
+            {% for i in range(1, MAX_MAP_SIZE - 1) %}
+            case {{i}} -> {
+                var rowMask = 0x7l << (loc.x - 1);
+                return (rowMask
+                        & passable{{i}}
+                        & passable{{i - 1}}
+                        & passable{{i + 1}}) == rowMask;
+            }
+            {% endfor %}
+            default -> {
+                return false;
+            }
+        }
+    }
+
+    public static boolean isKingPassable(MapLocation loc) {
+        if(RatKing.is5x5) {
+            return isPassable5x5(loc);
+        } else {
+            return isPassable3x3(loc);
+        }
+    }
+
+    public static void storeCell(MapInfo info) throws GameActionException {
+        var loc = info.getMapLocation();
+        var locX = loc.x;
+        // rc.setIndicatorDot(loc, 255, 255, 0);
+        switch(loc.y) {
+            {% for i in range(MAX_MAP_SIZE) %}
+            case {{i}} -> {
+                if(info.isDirt()) dirt{{i}} |= 1l << locX;
+                else dirt{{i}} &= ~(1l << locX);
+                if (info.isWall()) {
+                    mapData[{{i}}].setCharAt(locX, '\2');
+                } else {
+                    mapData[{{i}}].setCharAt(locX, '\1');
+                }
+                if((seen{{i}} & 1l << locX) == 0l) {
+                    seen{{i}} |= 1l << locX;
+                    if(info.hasCheeseMine()) Squeaker.registerMine(loc);
+                    if(!info.isWall()) {
+                        passable{{i}} |= 1l << locX;
+                    }
+                }
+            }
+            {% endfor %}
+        }
+    }
+
+    public static void storeCellKing(MapInfo info) throws GameActionException {
+        var loc = info.getMapLocation();
+        var locX = loc.x;
+        // rc.setIndicatorDot(loc, 255, 255, 0);
+        switch(loc.y) {
+            {% for i in range(MAX_MAP_SIZE) %}
+            case {{i}} -> {
+                if(info.isDirt()) dirt{{i}} |= 1l << locX;
+                else dirt{{i}} &= ~(1l << locX);
+                if((seen{{i}} & 1l << locX) == 0l) {
+                    seen{{i}} |= 1l << locX;
+                    if(info.hasCheeseMine()) Squeaker.registerMine(loc);
+                    if(!info.isWall()) {
+                        passable{{i}} |= 1l << locX;
+                    }
+                }
+            }
+            {% endfor %}
+        }
+    }
+
+    public static void storeVisibleCells() throws GameActionException {
+        // Profiler.begin();
+        int x = myLoc.x, y = myLoc.y;
+        switch(myDir.ordinal()) {
+            {% for i in range(8) %}
+            {% set dir = directions[i] %}
+            case {{i}} -> {
+                {% for dx in range(-5, 6) %}
+                {% for dy in range(-5, 6) %}
+                {% if dir == "Direction.NORTH" %}       {% set visible = dy >= (dx|abs) %}
+                {% elif dir == "Direction.NORTHEAST" %} {% set visible = dx >= 0 and dy >= 0 %}
+                {% elif dir == "Direction.EAST" %}      {% set visible = dx >= (dy|abs) %}
+                {% elif dir == "Direction.SOUTHEAST" %} {% set visible = dx >= 0 and dy <= 0 %}
+                {% elif dir == "Direction.SOUTH" %}     {% set visible = dy <= -(dx|abs) %}
+                {% elif dir == "Direction.SOUTHWEST" %} {% set visible = dx <= 0 and dy <= 0 %}
+                {% elif dir == "Direction.WEST" %}      {% set visible = dx <= -(dy|abs) %}
+                {% elif dir == "Direction.NORTHWEST" %} {% set visible = dx <= 0 and dy >= 0 %}
+                {% endif %}
+                {% if dx * dx + dy * dy <= 20 and visible %}
+                {
+                    var l = new MapLocation(x {% if dx %} + {{dx}} {% endif %}, y {% if dy %} + {{dy}} {% endif %});
+                    if(rc.onTheMap(l)) {
+                        CellTracker.storeCell(rc.senseMapInfo(l));
+                    }
+                }
+                {% endif %}
+                {% endfor %}
+                {% endfor %}
+            }
+            {% endfor %}
+        }
+        // Profiler.end("storeVisibleCells");
+    }
+
+    public static void storeVisibleCellsPostMoveForward() throws GameActionException {
+        // Profiler.begin();
+        int x = myLoc.x, y = myLoc.y;
+        switch(myDir.ordinal()) {
+            {% for i in range(8) %}
+            {% set dir = directions[i] %}
+            case {{i}} -> {
+                {% for dx in range(-5, 6) %}
+                {% for dy in range(-5, 6) %}
+                {% if dir == "Direction.NORTH" %}       {% set visible = dy >= (dx|abs)      and dx ** 2 + (dy + 1) ** 2 > 20 %}
+                {% elif dir == "Direction.NORTHEAST" %} {% set visible = dx >= 0 and dy >= 0 and (dx + 1) ** 2 + (dy + 1) ** 2 > 20 %}
+                {% elif dir == "Direction.EAST" %}      {% set visible = dx >= (dy|abs)      and (dx + 1) ** 2 + dy ** 2 > 20 %}
+                {% elif dir == "Direction.SOUTHEAST" %} {% set visible = dx >= 0 and dy <= 0 and (dx + 1) ** 2 + (dy - 1) ** 2 > 20 %}
+                {% elif dir == "Direction.SOUTH" %}     {% set visible = dy <= -(dx|abs)     and dx ** 2 + (dy - 1) ** 2 > 20 %}
+                {% elif dir == "Direction.SOUTHWEST" %} {% set visible = dx <= 0 and dy <= 0 and (dx - 1) ** 2 + (dy - 1) ** 2 > 20 %}
+                {% elif dir == "Direction.WEST" %}      {% set visible = dx <= -(dy|abs)     and (dx - 1) ** 2 + dy ** 2 > 20 %}
+                {% elif dir == "Direction.NORTHWEST" %} {% set visible = dx <= 0 and dy >= 0 and (dx - 1) ** 2 + (dy + 1) ** 2 > 20%}
+                {% endif %}
+                {% if dx * dx + dy * dy <= 20 and visible %}
+                {
+                    var l = new MapLocation(x {% if dx %} + {{dx}} {% endif %}, y {% if dy %} + {{dy}} {% endif %});
+                    if(rc.onTheMap(l)) {
+                        CellTracker.storeCell(rc.senseMapInfo(l));
+                    }
+                }
+                {% endif %}
+                {% endfor %}
+                {% endfor %}
+            }
+            {% endfor %}
+        }
+        // Profiler.end("storeVisibleCellsPostMove");
+    }
+
+    public static void storeVisibleCellsKing() throws GameActionException {
+        // IF TLE: tone this down
+        // Profiler.begin();
+        for(var info : rc.senseNearbyMapInfos()) {
+            CellTracker.storeCellKing(info);
+        }
+        // Profiler.end("storeVisibleCellsKing");
+    }
+
+    public static long localPassable0, localPassable1;
+    public static long localDirt0, localDirt1;
+    {% for mask in ["dirt", "passable"] %}
+    private static void computeLocal{{capitalise(mask)}}() {
+        local{{capitalise(mask)}}0 = 0;
+        local{{capitalise(mask)}}1 = 0;
+        switch(myLoc.y) {
+            {% for i in range(MAX_MAP_SIZE) %}
+            case {{i}} -> {
+                // get the 11 relevant bits from row i + dy, shifted by off
+                {% macro get11bits(dy, off) %}
+                ((myLoc.x - 5 >= 0
+                  ? {{mask}}{{i + dy}} >> (myLoc.x - 5)
+                  : {{mask}}{{i + dy}} << (5 - myLoc.x))
+                 & 0x7ff) {% if off %} << {{off}} {% endif %}
+                {% endmacro %}
+
+                {% for dy in range(-5, 0) %}
+                {% if i + dy >= 0 and i + dy < MAX_MAP_SIZE %}
+                local{{capitalise(mask)}}0 |= {{ get11bits(dy, (dy + 5) * 11) }};
+                {% endif %}
+                {% endfor %}
+
+                local{{capitalise(mask)}}0 |= {{ get11bits(0, 55) }} & 0x1f80000000000000l;
+                local{{capitalise(mask)}}1 |= {{ get11bits(0, 0) }} >> 6;
+
+                {% for dy in range(1, 6) %}
+                {% if i + dy < MAX_MAP_SIZE %}
+                local{{capitalise(mask)}}1 |= {{ get11bits(dy, (dy - 1) * 11 + 5) }};
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+        }
+    }
+    {% endfor %}
+    static MapLocation localBfsPos = new MapLocation(-1, -1);
+    public static void computeLocalBfsMasks() {
+        if(myLoc.equals(localBfsPos)) return;
+        localBfsPos = myLoc;
+        {% for mask in ["dirt", "passable"] %}
+        computeLocal{{capitalise(mask)}}();
+        {% endfor %}
+    }// indicate
+
+    // symmetry checker
+    public enum Symmetry {
+        Unknown,
+        Rotational,
+        Horizontal,
+        Vertical
+    };
+    public static int rsym = 1, hsym = 1, vsym = 1;
+    public static boolean isSymmetryKnown() {
+        return vsym + hsym + rsym == 1;
+    }
+
+    public static Symmetry getSymmetry() {
+        return switch (vsym * 4 + hsym * 2 + rsym) {
+            case 1 -> Symmetry.Rotational;
+            case 2 -> Symmetry.Horizontal;
+            case 4 -> Symmetry.Vertical;
+            default -> Symmetry.Unknown;
+        };
+    }
+
+    public static void setSymmetry(int cur_sym) {
+        switch (cur_sym) {
+            case 1 -> {
+                CellTracker.hsym = CellTracker.vsym = 0;
+                CellTracker.rsym = 1;
+            }
+            case 2 -> {
+                CellTracker.rsym = CellTracker.vsym = 0;
+                CellTracker.hsym = 1;
+            }
+            case 3 -> {
+                CellTracker.rsym = CellTracker.hsym = 0;
+                CellTracker.vsym = 1;
+            }
+        }
+    }
+
+    static void checkHor() {
+        var shiftAmount = 64 - mapWidth;
+        switch(myLoc.y) {
+            {% for posY in range(60) %}
+            case {{posY}} -> {
+                // IF TLE: change this range to [-4, 5) for all functions
+                {% for y in range(posY - 5, posY + 6) %}
+                {% if y >= 0 and y < 60 %}
+                {
+                    var seenFused = seen{{y}} & (Long.reverse(seen{{y}}) >>> shiftAmount);
+                    var passableFused = passable{{y}} ^ (Long.reverse(passable{{y}}) >>> shiftAmount);
+                    if((passableFused & seenFused) != 0) {
+                        hsym = 0;
+                        return;
+                    }
+                }
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> {}
+        }
+    }
+
+    static void applyHor() {
+        var shiftAmount = 64 - mapWidth;
+        switch(myLoc.y) {
+            {% for posY in range(60) %}
+            case {{posY}} -> {
+                {% for y in range(posY - 5, posY + 6) %}
+                {% if y >= 0 and y < 60 %}
+                {
+                    seen{{y}} |= Long.reverse(seen{{y}}) >>> shiftAmount;
+                    passable{{y}} |= Long.reverse(passable{{y}}) >>> shiftAmount;
+                }
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> {}
+        }
+    }
+
+    {% for height in range(20, 61) %}
+    private static void checkVer{{height}}() {
+        switch(myLoc.y) {
+            {% for posY in range(height) %}
+            case {{posY}} -> {
+                {% for y in range(posY - 5, posY + 6) %}
+                {% if y >= 0 and y < height and y * 2 + 1 != height and (y < height / 2) == (posY < height / 2) %}
+                {
+                    var seenFused = seen{{y}} & seen{{height - y - 1}};
+                    var passableFused = passable{{y}} ^ passable{{height - y - 1}};
+                    if((passableFused & seenFused) != 0) {
+                        vsym = 0;
+                        return;
+                    }
+                }
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> {}
+        }
+    }
+    private static void applyVer{{height}}() {
+        switch(myLoc.y) {
+            {% for posY in range(height) %}
+            case {{posY}} -> {
+                {% for y in range(posY - 5, posY + 6) %}
+                {% if y >= 0 and y < height and y * 2 + 1 != height and (y < height / 2) == (posY < height / 2) %}
+                {
+                    seen{{y}} = seen{{height - y - 1}} |= seen{{y}};
+                    passable{{y}} = passable{{height - y - 1}} |= passable{{y}};
+                }
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> {}
+        }
+    }
+    {% endfor %}
+
+    static void checkVer() {
+        switch(mapHeight) {
+            {% for height in range(20, 61) %}
+            case {{height}} -> {
+                checkVer{{height}}();
+            }
+            {% endfor %}
+        }
+    }
+    static void applyVer() {
+        switch(mapHeight) {
+            {% for height in range(20, 61) %}
+            case {{height}} -> {
+                applyVer{{height}}();
+            }
+            {% endfor %}
+        }
+    }
+
+    {% for height in range(20, 61) %}
+    private static void checkRot{{height}}() {
+        var shiftAmount = 64 - mapWidth;
+        switch(myLoc.y) {
+            {% for posY in range(height) %}
+            case {{posY}} -> {
+                {% for y in range(posY - 5, posY + 6) %}
+                {% if y >= 0 and y < height and y * 2 + 1 != height and (y < height / 2) == (posY < height / 2) %}
+                {
+                    var seenFused = seen{{y}} & (Long.reverse(seen{{height - y - 1}}) >>> shiftAmount);
+                    var passableFused = passable{{y}} ^ (Long.reverse(passable{{height - y - 1}}) >>> shiftAmount);
+                    if((passableFused & seenFused) != 0) {
+                        rsym = 0;
+                        return;
+                    }
+                }
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> {}
+        }
+    }
+    private static void applyRot{{height}}() {
+        var shiftAmount = 64 - mapWidth;
+        switch(myLoc.y) {
+            {% for posY in range(height) %}
+            case {{posY}} -> {
+                {% for y in range(posY - 5, posY + 6) %}
+                {% if y >= 0 and y < height and y * 2 + 1 != height and (y < height / 2) == (posY < height / 2) %}
+                {
+                    seen{{y}} |= (Long.reverse(seen{{height - y - 1}}) >>> shiftAmount);
+                    seen{{height - y - 1}} = (Long.reverse(seen{{y}}) >>> shiftAmount);
+                    passable{{y}} |= (Long.reverse(passable{{height - y - 1}}) >>> shiftAmount);
+                    passable{{height - y - 1}} = (Long.reverse(passable{{y}}) >>> shiftAmount);
+                }
+                {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> {}
+        }
+    }
+    {% endfor %}
+
+    static void checkRot() {
+        switch(mapHeight) {
+            {% for height in range(20, 61) %}
+            case {{height}} -> {
+                checkRot{{height}}();
+            }
+            {% endfor %}
+        }
+    }
+    static void applyRot() {
+        switch(mapHeight) {
+            {% for height in range(20, 61) %}
+            case {{height}} -> {
+                applyRot{{height}}();
+            }
+            {% endfor %}
+        }
+    }
+
+    public static void checkSymmetry() {
+        switch(getSymmetry().ordinal()) {
+            case 0 -> {
+                // Profiler.begin();
+                // IF TLE: check one per turn instead of all 3
+                if(hsym != 0) checkHor();
+                if(vsym != 0) checkVer();
+                if(rsym != 0) checkRot();
+                // Profiler.end("checkSymmetry");
+            }
+            case 1 -> {
+                // Profiler.begin();
+                applyRot();
+                // Profiler.end("applyRot");
+            }
+            case 2 -> {
+                // Profiler.begin();
+                applyHor();
+                // Profiler.end("applyHor");
+            }
+            case 3 -> {
+                // Profiler.begin();
+                applyVer();
+                // Profiler.end("applyVer");
+            }
+        }
+    }
+}

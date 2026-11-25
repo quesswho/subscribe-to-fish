@@ -1,0 +1,610 @@
+#!/usr/bin/env python3
+"""Map generator that keeps the style of the map pool.
+
+  tools/mapgen fresh 50                 50 new maps in testmaps/gen/
+  tools/mapgen fresh 10 --seed 7 --out /tmp/maps
+  tools/mapgen jitter rift --copies 8   near copies of a pool map in testmaps/jitter/
+  tools/mapgen jitter --all --copies 4  near copies of every pool map
+  tools/mapgen show testmaps/gen/gen_3.map26
+
+fresh: each map borrows its parameters from a random pool map (size, symmetry, share of walls and dirt, mine
+and cat counts, how far apart the kings start) and builds a layout from the motifs the pool is made of: long
+walls, arcs, rooms with doors, lattices, blobs, dirt corners, dirt bands and speckle. jitter: moves the mines,
+kings and cat patrols of a pool map a little and reshapes some walls and dirt, so a bot is tested on the same
+kind of game without the exact map. Everything is mirrored, and every map passes the engine's checks
+(LiveMap.assertIsValid) plus playability ones: kings and mines reachable, room for the kings, cat patrols that a
+2x2 cat can walk. Output is deterministic in --seed.
+"""
+import argparse
+import math
+import random
+import sys
+import zlib
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+import mapcodec as M  # noqa: E402
+
+DIRS8 = [(1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1)]
+
+
+# ---------------------------------------------------------------- style of the pool
+
+
+def pool_styles():
+    styles = []
+    for name in F.list_maps(F.MAPS):
+        if name in F.SKIP_MAPS:
+            continue
+        m = M.load(F.MAPS / f"{name}.map26")
+        n = m.width * m.height
+        kings = [b for b in m.bodies if b.type == M.RAT_KING]
+        cats = [b for b in m.bodies if b.type == M.CAT]
+        if len(kings) != 2:
+            continue
+        kd = math.dist((kings[0].x, kings[0].y), (kings[1].x, kings[1].y)) / math.hypot(m.width, m.height)
+        styles.append(dict(
+            name=name, w=m.width, h=m.height, sym=m.symmetry, walls=sum(map(sum, m.walls)) / n,
+            dirt=sum(map(sum, m.dirt)) / n, mines=len(m.mines) / n, cats=len(cats), king_dist=kd,
+            waypoints=sum(len(v) for v in m.cats.values()) / max(1, len(m.cats))))
+    return styles
+
+
+# ---------------------------------------------------------------- the map being built
+
+
+class Layout:
+    def __init__(self, w, h, sym, rng):
+        self.w, self.h, self.sym, self.rng = w, h, sym, rng
+        self.wall = [[False] * w for _ in range(h)]
+        self.dirt = [[False] * w for _ in range(h)]
+
+    def on(self, x, y):
+        return 0 <= x < self.w and 0 <= y < self.h
+
+    def mirror(self, x, y):
+        sx = x if self.sym == M.HORIZONTAL else self.w - 1 - x
+        sy = y if self.sym == M.VERTICAL else self.h - 1 - y
+        return sx, sy
+
+    def put(self, grid, cells):
+        for x, y in cells:
+            if self.on(x, y):
+                grid[y][x] = True
+                mx, my = self.mirror(x, y)
+                grid[my][mx] = True
+
+    def count(self, grid):
+        return sum(map(sum, grid))
+
+    def share(self, grid):
+        return self.count(grid) / (self.w * self.h)
+
+    def open(self, x, y):
+        return self.on(x, y) and not self.wall[y][x]
+
+
+# ---------------------------------------------------------------- motifs: each returns a list of cells
+
+
+def thick(cells, t):
+    out = set(cells)
+    if t >= 2:
+        for x, y in cells:
+            out |= {(x + 1, y), (x, y + 1), (x + 1, y + 1)}
+    return list(out)
+
+
+def segment(x0, y0, x1, y1):
+    n = max(abs(x1 - x0), abs(y1 - y0), 1)
+    return [(round(x0 + (x1 - x0) * i / n), round(y0 + (y1 - y0) * i / n)) for i in range(n + 1)]
+
+
+def m_bar(L, r):
+    x, y = r.randrange(L.w), r.randrange(L.h)
+    length = r.randint(4, max(5, int(0.45 * max(L.w, L.h))))
+    dx, dy = r.choice([(1, 0), (0, 1), (1, 0), (0, 1), (1, 1), (1, -1)])
+    cells = segment(x, y, x + dx * length, y + dy * length)
+    if length > 8 and r.random() < 0.5:  # a gap to squeeze through
+        g = r.randrange(2, length - 3)
+        cells = cells[:g] + cells[g + r.randint(2, 3):]
+    return thick(cells, r.choice([1, 1, 2]))
+
+
+def m_arc(L, r):
+    cx, cy = r.randrange(L.w), r.randrange(L.h)
+    rad = r.randint(4, max(5, min(L.w, L.h) // 3))
+    a0 = r.uniform(0, 2 * math.pi)
+    span = r.uniform(0.8, 1.7) * math.pi
+    steps = int(rad * span * 1.5) + 2
+    cells = {(round(cx + rad * math.cos(a0 + span * i / steps)), round(cy + rad * math.sin(a0 + span * i / steps)))
+             for i in range(steps + 1)}
+    return thick(list(cells), r.choice([1, 1, 2]))
+
+
+def m_room(L, r):
+    w, h = r.randint(5, max(6, L.w // 3)), r.randint(5, max(6, L.h // 3))
+    x, y = r.randrange(0, max(1, L.w - w)), r.randrange(0, max(1, L.h - h))
+    outline = [(x + i, y) for i in range(w)] + [(x + i, y + h - 1) for i in range(w)]
+    outline += [(x, y + j) for j in range(h)] + [(x + w - 1, y + j) for j in range(h)]
+    outline = set(outline)
+    for _ in range(r.randint(1, 3)):  # doors
+        side = r.randrange(4)
+        if side < 2:
+            dx = r.randrange(1, w - 2)
+            door = {(x + dx, y + (0 if side == 0 else h - 1)), (x + dx + 1, y + (0 if side == 0 else h - 1))}
+        else:
+            dy = r.randrange(1, h - 2)
+            door = {(x + (0 if side == 2 else w - 1), y + dy), (x + (0 if side == 2 else w - 1), y + dy + 1)}
+        outline -= door
+    return list(outline)
+
+
+def m_lattice(L, r):
+    step = r.randint(2, 4)
+    w, h = r.randint(6, max(7, L.w // 2)), r.randint(6, max(7, L.h // 2))
+    x0, y0 = r.randrange(0, max(1, L.w - w)), r.randrange(0, max(1, L.h - h))
+    return [(x0 + i, y0 + j) for i in range(0, w, step) for j in range(0, h, step)]
+
+
+def m_blob(L, r, size=None):
+    size = size or r.randint(4, 40)
+    x, y = r.randrange(L.w), r.randrange(L.h)
+    cells = {(x, y)}
+    frontier = [(x, y)]
+    while len(cells) < size and frontier:
+        cx, cy = r.choice(frontier)
+        dx, dy = r.choice(DIRS8[:4])
+        c = (cx + dx, cy + dy)
+        if L.on(*c) and c not in cells:
+            cells.add(c)
+            frontier.append(c)
+    return list(cells)
+
+
+def m_pillars(L, r):
+    return [(r.randrange(L.w), r.randrange(L.h)) for _ in range(r.randint(3, 12))]
+
+
+WALL_MOTIFS = [(m_bar, 5), (m_arc, 3), (m_room, 2), (m_lattice, 1), (m_blob, 3), (m_pillars, 1)]
+
+
+def d_blob(L, r):
+    return m_blob(L, r, r.randint(15, max(16, int(0.12 * L.w * L.h))))
+
+
+def d_corner(L, r):
+    cx, cy = r.choice([(0, 0), (L.w - 1, 0), (0, L.h - 1), (L.w - 1, L.h - 1)])
+    rad = r.randint(4, max(5, min(L.w, L.h) // 3))
+    return [(x, y) for x in range(L.w) for y in range(L.h)
+            if math.hypot(x - cx, y - cy) <= rad + r.uniform(-1, 1)]
+
+
+def d_band(L, r):
+    if r.random() < 0.5:
+        x = r.randrange(L.w)
+        cells = [(x + d, y) for y in range(L.h) for d in range(r.randint(1, 3))]
+    else:
+        y = r.randrange(L.h)
+        cells = [(x, y + d) for x in range(L.w) for d in range(r.randint(1, 3))]
+    return cells
+
+
+def d_speckle(L, r):
+    w, h = r.randint(6, L.w), r.randint(6, L.h)
+    x0, y0 = r.randrange(0, max(1, L.w - w + 1)), r.randrange(0, max(1, L.h - h + 1))
+    p = r.uniform(0.15, 0.45)
+    return [(x0 + i, y0 + j) for i in range(w) for j in range(h) if r.random() < p]
+
+
+def d_ring(L, r):
+    cx, cy = r.randrange(L.w), r.randrange(L.h)
+    rad = r.randint(3, max(4, min(L.w, L.h) // 4))
+    return [(x, y) for x in range(cx - rad - 1, cx + rad + 2) for y in range(cy - rad - 1, cy + rad + 2)
+            if abs(math.hypot(x - cx, y - cy) - rad) < 1.0]
+
+
+DIRT_MOTIFS = [(d_blob, 4), (d_corner, 2), (d_band, 1), (d_speckle, 3), (d_ring, 1)]
+
+
+def pick(r, motifs):
+    total = sum(w for _, w in motifs)
+    x = r.uniform(0, total)
+    for f, w in motifs:
+        x -= w
+        if x <= 0:
+            return f
+    return motifs[-1][0]
+
+
+# ---------------------------------------------------------------- placing pieces
+
+
+def clear3(L, x, y):
+    return all(L.on(x + i, y + j) and not L.wall[y + j][x + i] and not L.dirt[y + j][x + i]
+               for i in (-1, 0, 1) for j in (-1, 0, 1))
+
+
+def cat_fits(L, x, y):
+    """A cat at corner (x, y) needs (x, y), N, NE, E free of walls (GameWorld.bfsFromTarget)."""
+    return all(L.open(x + i, y + j) for i, j in ((0, 0), (0, 1), (1, 1), (1, 0)))
+
+
+def cat_reach(L, start):
+    seen = {start}
+    stack = [start]
+    while stack:
+        x, y = stack.pop()
+        for dx, dy in DIRS8:
+            c = (x + dx, y + dy)
+            if c not in seen and cat_fits(L, *c):
+                seen.add(c)
+                stack.append(c)
+    return seen
+
+
+def rat_component(L, start):
+    seen = {start}
+    stack = [start]
+    while stack:
+        x, y = stack.pop()
+        for dx, dy in DIRS8:
+            c = (x + dx, y + dy)
+            if c not in seen and L.open(*c):
+                seen.add(c)
+                stack.append(c)
+    return seen
+
+
+def place_mines(L, r, target):
+    mines = []
+
+    def ok(p):
+        if not L.open(*p) or L.dirt[p[1]][p[0]] and r.random() < 0.7:
+            return False
+        if any(L.wall[y][x] for x in range(p[0] - 2, p[0] + 3) for y in range(p[1] - 2, p[1] + 3)
+               if L.on(x, y) and (x - p[0]) ** 2 + (y - p[1]) ** 2 <= 8):
+            return False
+        return all((p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 >= 25 for q in mines)
+
+    for _ in range(target * 60):
+        if len(mines) >= target:
+            break
+        p = (r.randrange(2, L.w - 2), r.randrange(2, L.h - 2))
+        q = L.mirror(*p)
+        if p == q or (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < 25:
+            continue
+        if ok(p):
+            mines.append(p)
+            if ok(q):
+                mines.append(q)
+            else:
+                mines.pop()
+    return mines
+
+
+def place_kings(L, r, dist_ratio):
+    diag = math.hypot(L.w, L.h)
+    best, best_err = None, None
+    for _ in range(400):
+        p = (r.randrange(1, L.w - 1), r.randrange(1, L.h - 1))
+        q = L.mirror(*p)
+        if not clear3(L, *p) or not clear3(L, *q):
+            continue
+        if max(abs(p[0] - q[0]), abs(p[1] - q[1])) < 5:
+            continue
+        err = abs(math.dist(p, q) / diag - dist_ratio)
+        if best is None or err < best_err:
+            best, best_err = (p, q), err
+    return best
+
+
+def place_cats(L, r, pairs, kings, mines, n_waypoints):
+    cats = []
+    taken = set()
+    for _ in range(pairs):
+        for _ in range(300):
+            c = (r.randrange(L.w // 5, L.w - L.w // 5), r.randrange(L.h // 5, L.h - L.h // 5))
+            mc = cat_mirror(L, c)
+            if not cat_fits(L, *c) or not cat_fits(L, *mc):
+                continue
+            if any(math.dist(c, k) < 7 or math.dist(mc, k) < 7 for k in kings):
+                continue
+            foot = {(c[0] + i, c[1] + j) for i in (0, 1) for j in (0, 1)}
+            mfoot = {(mc[0] + i, mc[1] + j) for i in (0, 1) for j in (0, 1)}
+            if foot & mfoot or foot & taken or mfoot & taken:
+                continue
+            reach = list(cat_reach(L, c))
+            if len(reach) < 50:
+                continue
+            wps = [c]
+            # Patrols visit a few spots across the cat's reachable area, often near cheese mines.
+            near_mines = [p for p in reach if any(math.dist(p, m) < 6 for m in mines)]
+            for _ in range(n_waypoints - 1):
+                src = near_mines if near_mines and r.random() < 0.4 else reach
+                wps.append(r.choice(src))
+            cats.append((c, wps))
+            taken |= foot | mfoot
+            break
+    return cats
+
+
+def cat_mirror(L, corner):
+    """The corner of the mirrored cat: the mirror of a 2x2 footprint, by its bottom-left cell."""
+    xs = {L.mirror(corner[0] + i, corner[1] + j)[0] for i in (0, 1) for j in (0, 1)}
+    ys = {L.mirror(corner[0] + i, corner[1] + j)[1] for i in (0, 1) for j in (0, 1)}
+    return min(xs), min(ys)
+
+
+def chiral_corner(L, bottom_left):
+    """InternalRobot.getCatCornerByChirality for chirality 1."""
+    x, y = bottom_left
+    return {M.VERTICAL: (x + 1, y), M.HORIZONTAL: (x, y + 1), M.ROTATIONAL: (x + 1, y + 1)}[L.sym]
+
+
+# ---------------------------------------------------------------- assembling and checking
+
+
+def validate(m: M.GameMap):
+    """LiveMap.assertIsValid, plus playability. Returns None if fine, else the reason."""
+    n = m.width * m.height
+    if not (20 <= m.width <= 60 and 20 <= m.height <= 60):
+        return "size"
+    walls = sum(map(sum, m.walls))
+    dirt = sum(map(sum, m.dirt))
+    if walls * 100 >= n * 20:
+        return "too many walls"
+    if dirt * 100 >= n * 50:
+        return "too much dirt"
+    for i, p in enumerate(m.mines):
+        if m.walls[p[1]][p[0]]:
+            return "wall on mine"
+        for q in m.mines[i + 1:]:
+            if (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2 < 25:
+                return "mines too close"
+        for x in range(p[0] - 2, p[0] + 3):
+            for y in range(p[1] - 2, p[1] + 3):
+                if 0 <= x < m.width and 0 <= y < m.height and m.walls[y][x] and (x - p[0]) ** 2 + (y - p[1]) ** 2 <= 8:
+                    return "wall next to mine"
+    kings = [b for b in m.bodies if b.type == M.RAT_KING]
+    if sorted(b.team for b in kings) != [M.TEAM_A, M.TEAM_B]:
+        return "kings"
+    return None
+
+
+def build(m: M.GameMap, L: Layout, mines, kings, cats):
+    m.walls, m.dirt, m.mines = L.wall, L.dirt, sorted(mines)
+    m.bodies, m.cats = [], {}
+    ids = list(range(1, 3 + 2 * len(cats)))
+    L.rng.shuffle(ids)
+    (ka, kb) = kings
+    m.bodies.append(M.Body(ids.pop(), ka[0], ka[1], 0, 0, M.TEAM_A, M.RAT_KING))
+    m.bodies.append(M.Body(ids.pop(), kb[0], kb[1], 0, 1, M.TEAM_B, M.RAT_KING))
+    for corner, wps in cats:
+        a, b = ids.pop(), ids.pop()
+        mc = cat_mirror(L, corner)
+        m.bodies.append(M.Body(a, corner[0], corner[1], 0, 0, M.TEAM_A, M.CAT))
+        m.bodies.append(M.Body(b, mc[0], mc[1], 0, 1, M.TEAM_A, M.CAT))
+        m.cats[a] = list(wps)
+        m.cats[b] = [L.mirror(*p) for p in wps]
+        # The mirrored cat starts at its first waypoint, like the original does.
+        assert chiral_corner(L, mc) == m.cats[b][0]
+    return m
+
+
+def playable(L, mines, kings, cats):
+    comp = rat_component(L, kings[0])
+    if kings[1] not in comp or any(p not in comp for p in mines):
+        return False
+    open_cells = L.w * L.h - L.count(L.wall)
+    if len(comp) < 0.93 * open_cells:
+        return False
+    for corner, wps in cats:
+        reach = cat_reach(L, corner)
+        if any(p not in reach for p in wps):
+            return False
+    return True
+
+
+def fresh(name, rng, styles):
+    st = rng.choice(styles)
+    # Sizes, symmetry and amounts follow a real map, with some spread.
+    w = min(60, max(20, st["w"] + rng.randint(-6, 6)))
+    h = min(60, max(20, st["h"] + rng.randint(-6, 6)))
+    sym = st["sym"] if rng.random() < 0.7 else rng.choice([M.ROTATIONAL, M.ROTATIONAL, M.HORIZONTAL, M.VERTICAL])
+    wall_target = min(0.19, max(0.0, st["walls"] * rng.uniform(0.7, 1.3)))
+    dirt_target = min(0.45, max(0.0, st["dirt"] * rng.uniform(0.6, 1.4)))
+    mine_target = max(2, round(st["mines"] * w * h * rng.uniform(0.7, 1.3) / 2) * 2)
+    cat_pairs = max(1, min(4, st["cats"] // 2))
+    for _ in range(60):
+        L = Layout(w, h, sym, rng)
+        for grid, motifs, target, cap in ((L.wall, WALL_MOTIFS, wall_target, 0.195),
+                                          (L.dirt, DIRT_MOTIFS, dirt_target, 0.48)):
+            for _ in range(200):
+                if L.share(grid) >= target:
+                    break
+                cells = [(x, y) for x, y in pick(rng, motifs)(L, rng) if L.on(x, y) and not L.wall[y][x]]
+                before = [row[:] for row in grid]
+                L.put(grid, cells)
+                if L.share(grid) >= cap:  # over the engine's limit: undo this motif and stop
+                    grid[:] = before
+                    break
+        for y in range(h):
+            for x in range(w):
+                if L.wall[y][x]:
+                    L.dirt[y][x] = False
+        mines = place_mines(L, rng, mine_target)
+        if len(mines) < 2:
+            continue
+        kings = place_kings(L, rng, st["king_dist"])
+        if not kings:
+            continue
+        cats = place_cats(L, rng, cat_pairs, kings, mines, max(2, min(8, round(st["waypoints"]))))
+        if len(cats) < cat_pairs:
+            continue
+        if not playable(L, mines, kings, cats):
+            continue
+        m = build(M.GameMap.blank(name, w, h, sym), L, mines, kings, cats)
+        m.seed = rng.randrange(1, 1 << 30)
+        if validate(m) is None:
+            return m, st["name"]
+    return None, st["name"]
+
+
+def jitter(src: M.GameMap, name, rng):
+    """A near copy: the same terrain with a few walls and dirt reshaped, and mines, kings and cats moved."""
+    for _ in range(80):
+        L = Layout(src.width, src.height, src.symmetry, rng)
+        L.wall = [row[:] for row in src.walls]
+        L.dirt = [row[:] for row in src.dirt]
+        n = src.width * src.height
+        for _ in range(rng.randint(1, 4)):  # nudge some wall cells
+            x, y = rng.randrange(src.width), rng.randrange(src.height)
+            if L.wall[y][x]:
+                dx, dy = rng.choice(DIRS8[:4])
+                if L.on(x + dx, y + dy):
+                    L.put(L.wall, [(x + dx, y + dy)])
+                    L.wall[y][x] = False
+                    mx, my = L.mirror(x, y)
+                    L.wall[my][mx] = False
+        if rng.random() < 0.6:  # reshape dirt
+            for _ in range(rng.randint(1, 3)):
+                cells = [(x, y) for x, y in pick(rng, DIRT_MOTIFS)(L, rng) if L.on(x, y) and not L.wall[y][x]]
+                if rng.random() < 0.5:
+                    if L.share(L.dirt) + 2 * len(cells) / n < 0.48:
+                        L.put(L.dirt, cells)
+                else:
+                    for x, y in cells:
+                        L.dirt[y][x] = False
+                        mx, my = L.mirror(x, y)
+                        L.dirt[my][mx] = False
+        if L.share(L.wall) >= 0.195 or L.share(L.dirt) >= 0.48:
+            continue
+        # Mines move a few cells, keeping their count.
+        mines, done = [], set()
+
+        def fits(trial, new):
+            return all(L.open(*t) and not any(L.wall[y][x] for x in range(t[0] - 2, t[0] + 3)
+                                               for y in range(t[1] - 2, t[1] + 3)
+                                               if L.on(x, y) and (x - t[0]) ** 2 + (y - t[1]) ** 2 <= 8)
+                       for t in new) and all((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 >= 25
+                                             for i, a in enumerate(trial) for b in trial[i + 1:])
+
+        for p in src.mines:
+            if p in done:
+                continue
+            q = L.mirror(*p)
+            done |= {p, q}
+            for attempt in range(31):
+                # Each mirrored pair moves a few cells; the last attempt keeps it where it was.
+                c = p if attempt == 30 else (p[0] + rng.randint(-3, 3), p[1] + rng.randint(-3, 3))
+                mc = L.mirror(*c)
+                if not (2 <= c[0] < L.w - 2 and 2 <= c[1] < L.h - 2) or c == mc:
+                    continue
+                if fits(mines + [c, mc], (c, mc)):
+                    mines += [c, mc]
+                    break
+        kings_src = sorted((b for b in src.bodies if b.type == M.RAT_KING), key=lambda b: b.team)
+        ka = (kings_src[0].x, kings_src[0].y)
+        kings = None
+        for _ in range(40):
+            c = (ka[0] + rng.randint(-3, 3), ka[1] + rng.randint(-3, 3))
+            if L.on(*c) and clear3(L, *c) and clear3(L, *L.mirror(*c)) and c != L.mirror(*c):
+                kings = (c, L.mirror(*c))
+                break
+        if not kings:
+            continue
+        cats = []
+        chiral0 = [b for b in src.bodies if b.type == M.CAT and b.chirality == 0]
+        for b in chiral0:
+            wps = src.cats.get(b.id, [(b.x, b.y)])
+            corner = (b.x, b.y)
+            if not cat_fits(L, *corner):
+                break
+            reach = cat_reach(L, corner)
+            moved = [corner]
+            for p in wps[1:]:
+                c = (p[0] + rng.randint(-2, 2), p[1] + rng.randint(-2, 2))
+                moved.append(c if c in reach else p)
+            cats.append((corner, moved))
+        if len(cats) != len(chiral0) or not playable(L, mines, kings, cats):
+            continue
+        m = build(M.GameMap.blank(name, src.width, src.height, src.symmetry), L, mines, kings, cats)
+        m.seed = rng.randrange(1, 1 << 30)
+        if validate(m) is None:
+            return m
+    return None
+
+
+def show(m: M.GameMap):
+    grid = [["#" if m.walls[y][x] else ("." if m.dirt[y][x] else " ") for x in range(m.width)] for y in range(m.height)]
+    for x, y in m.mines:
+        grid[y][x] = "M"
+    for pts in m.cats.values():
+        for x, y in pts:
+            if grid[y][x] == " ":
+                grid[y][x] = "o"
+    for b in m.bodies:
+        grid[b.y][b.x] = "K" if b.type == M.RAT_KING else "C"
+    sym = {0: "rotational", 1: "horizontal", 2: "vertical"}[m.symmetry]
+    print(f"{m.name} {m.width}x{m.height} {sym}, {len(m.mines)} mines, {len(m.cats)} cats")
+    for row in reversed(grid):
+        print("".join(row))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    a = sub.add_parser("fresh")
+    a.add_argument("count", type=int)
+    a.add_argument("--seed", type=int, default=1)
+    a.add_argument("--out", default=str(F.TESTMAPS / "gen"))
+    a.add_argument("--prefix", default="gen")
+    j = sub.add_parser("jitter")
+    j.add_argument("maps", nargs="*")
+    j.add_argument("--all", action="store_true")
+    j.add_argument("--copies", type=int, default=4)
+    j.add_argument("--seed", type=int, default=1)
+    j.add_argument("--out", default=str(F.TESTMAPS / "jitter"))
+    s = sub.add_parser("show")
+    s.add_argument("map")
+    args = ap.parse_args()
+
+    if args.cmd == "show":
+        show(M.load(F.map_path(args.map)))
+        return 0
+    out = Path(args.out)
+    if args.cmd == "fresh":
+        styles = pool_styles()
+        made = 0
+        for i in range(args.count):
+            rng = random.Random(args.seed * 1000003 + i)
+            name = f"{args.prefix}_{args.seed}_{i}"
+            m, like = fresh(name, rng, styles)
+            if m is None:
+                print(f"{name}: no valid map in budget (style of {like})", file=sys.stderr)
+                continue
+            M.save(m, out / f"{name}.map26")
+            made += 1
+            print(f"{name}: {m.width}x{m.height}, like {like}")
+        print(f"{made} maps in {out}")
+        return 0 if made else 1
+    names = [m for m in F.list_maps(F.MAPS) if m not in F.SKIP_MAPS] if args.all else args.maps
+    made = 0
+    for name in names:
+        src = M.load(F.map_path(name))
+        for k in range(args.copies):
+            rng = random.Random(zlib.crc32(f"{name}/{k}/{args.seed}".encode()))
+            m = jitter(src, f"{src.name}_j{k}", rng)
+            if m is None:
+                print(f"{src.name}_j{k}: could not make a valid copy", file=sys.stderr)
+                continue
+            M.save(m, out / f"{m.name}.map26")
+            made += 1
+    print(f"{made} maps in {out}")
+    return 0 if made else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

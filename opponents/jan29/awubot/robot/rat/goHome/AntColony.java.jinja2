@@ -1,0 +1,71 @@
+package awubot.robot.rat.goHome;
+
+import battlecode.common.*;
+import static awubot.Game.*;
+import awubot.comms.GlobalArray;
+import static awubot.util.Util.*;
+import awubot.util.Profiler;
+
+public class AntColony {
+    public static StringBuilder[][] mark;
+    private static char[] base = new char[5];
+    private static char curMark;
+    private static int curKing = 0;
+    private static MapLocation[] lastKingLocs = new MapLocation[5];
+    public static boolean shouldMark;
+    private static void resetMarks(int i) {
+        // Profiler.begin();
+        base[i] = (char)(65536 - 3600);
+        StringBuilder row = new StringBuilder();
+        row.repeat('\uFFFF', mapWidth);
+        var rows = mark[i];
+        {% for j in range(60) %}
+        rows[{{j}}] = new StringBuilder(row);
+        {% endfor %}
+        // Profiler.end("ant colony init");
+    }
+    public static void init() {
+        mark = new StringBuilder[5][60];
+        curKing = GlobalArray.nearestRatKingId;
+        resetMarks(curKing);
+        shouldMark = true;
+        curMark = (char)(base[0] + 5);
+    }
+    public static void reachedHome() {
+        curKing = GlobalArray.nearestRatKingId;
+        shouldMark = true;
+        curMark = (char)(base[curKing] + 5);
+        // indicate("reached home " + GlobalArray.nearestRatKing);
+    }
+    public static void markCurrent() {
+        if(!shouldMark) {
+            // indicate("don't mark");
+            return;
+        }
+        // indicate("mark " + (int)curMark);
+        var row = mark[curKing][myLocY];
+        row.setCharAt(myLocX, (char)Math.min(curMark, row.charAt(myLocX)));
+        curMark++;
+    }
+    public static void preTick() {
+        for(int i = 0; i < 5; i++) {
+            var kingLoc = GlobalArray.getRatKing(i);
+            if(kingLoc != null) {
+                if(lastKingLocs[i] == null || !kingLoc.isAdjacentTo(lastKingLocs[i])) {
+                    // detected teleportation or first time, reset this king's marks
+                    resetMarks(i);
+                } else if(!kingLoc.equals(lastKingLocs[i])) {
+                    // king moved, decrease base mark (equivalent to incrementing all existing marks)
+                    // indicate("king " + i + " moved");
+                    {% for dx in [-1, 1] %}
+                    {% for dy in [-1, 1] %}
+                    mark[i][lastKingLocs[i].y + {{dy}}].setCharAt(lastKingLocs[i].x + {{dx}}, base[i]);
+                    {% endfor %}
+                    {% endfor %}
+                    base[i]--;
+                }
+                lastKingLocs[i] = kingLoc;
+            }
+        }
+    }
+}

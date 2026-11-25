@@ -1,0 +1,711 @@
+package awubot.robot.rat.combat.moves;
+
+import battlecode.common.Clock;
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+import battlecode.common.RobotInfo;
+import battlecode.common.UnitType;
+import battlecode.common.MapLocation;
+import battlecode.common.MapInfo;
+
+import awubot.robot.rat.combat.CombatCommon;
+import awubot.robot.rat.combat.CombatStrategy;
+import awubot.CellTracker;
+import awubot.RobotTracker;
+import awubot.comms.GlobalArray;
+import awubot.util.Profiler;
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import static awubot.robot.rat.BabyRat.*;
+
+{% set grid_radius = 4 %}
+
+{% macro occ_var(dx, dy) -%}
+occ_{{ "m" if dx < 0 else "" }}{{ dx|abs }}_{{ "m" if dy < 0 else "" }}{{ dy|abs }}
+{%- endmacro %}
+
+{% macro coord_x(dx) -%}
+myLocX{% if dx %} + {{ dx }}{% endif %}
+{%- endmacro %}
+
+{% macro coord_y(dy) -%}
+myLocY{% if dy %} + {{ dy }}{% endif %}
+{%- endmacro %}
+
+{% macro in_bounds_expr(dx, dy) -%}
+{%- set ns = namespace(conds=[]) -%}
+{%- if dx < 0 -%}
+{%- set ns.conds = ns.conds + ["myLocX >= " ~ (-dx)] -%}
+{%- elif dx > 0 -%}
+{%- set ns.conds = ns.conds + ["myLocX < mapWidth - " ~ dx] -%}
+{%- endif -%}
+{%- if dy < 0 -%}
+{%- set ns.conds = ns.conds + ["myLocY >= " ~ (-dy)] -%}
+{%- elif dy > 0 -%}
+{%- set ns.conds = ns.conds + ["myLocY < mapHeight - " ~ dy] -%}
+{%- endif -%}
+{%- if ns.conds|length > 0 -%}
+{{ ns.conds | join(" && ") }}
+{%- else -%}
+true
+{%- endif -%}
+{%- endmacro %}
+
+public final class TryThrow {
+    private TryThrow() {
+    }
+
+    static Direction md;
+    static Direction td;
+    static double best;
+    static double score;
+    static boolean isSecondary;
+    static int bytecodeStart, bytecodeBudget;
+    static char c;
+    {% for dy in range(grid_radius, -grid_radius - 1, -1) %}
+    {% for dx in range(-grid_radius, grid_radius + 1) %}
+    static RobotInfo {{ occ_var(dx, dy) }};
+    {% endfor %}
+    {% endfor %}
+
+    // return false if didnt throw -- some other process can figure out how to move
+    // TODO: maybe weight targets based on how close they are to friendly rats? might be too effort
+    public static boolean run() throws GameActionException {
+        if (!rc.isActionReady()) return false;
+        bytecodeStart = Clock.getBytecodeNum();
+        bytecodeBudget = Math.min(9000, Clock.getBytecodesLeft() - 2000);
+        md = null;
+        td = null;
+        isSecondary = false;
+        best = -1e9;
+        resetThrowGrid();
+        populateThrowGrid();
+        if (rc.getCarrying().getTeam() == team) {
+            selectMovesAlly();
+        } else {
+            selectMoves();
+        }
+        if (md == null || td == null) {
+            return false;
+        }
+        if (best < 0) {
+            // println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! TryThrow found no good throws (best=" + best + ")"); 
+            // debugThrowFail();
+            if (rc.getCarrying().getTeam() == team) return false;
+        }
+        // if (rc.getCarrying().getTeam() == team) {
+        //     rc.setTimelineMarker("threw ally " + myLoc, 0, 0, 255);
+        // }
+        if (isSecondary) {
+            if (td != myDir) turn(td);
+            assert(rc.canThrowRat());
+            rc.throwRat();
+            assert(CombatStrategy.performMoves(md, td));
+        } else {
+            assert(CombatStrategy.performMoves(md, td));
+            assert(rc.canThrowRat());
+            rc.throwRat();
+        }
+        return true;
+    }
+
+    private static void selectMoves() throws GameActionException {
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set facing = directions[ord] %}
+                {% set ordered_dirs = get_movements(facing) %}
+                {% for move_dir, is_wide_related in ordered_dirs %}
+                    move{{ dir_short_map[move_dir] }}();
+                    if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                    {% if move_dir == directions[ord] %}
+                        {% for dir in related_map[ord] %}
+                            {% for throw_dir in related_map[ord] %}
+                                tryThrowSecondary{{ dir_short_map[dir] }}{{ dir_short_map[throw_dir] }}();
+                                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                            {% endfor %}
+                        {% endfor %}
+                    {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { throw new RuntimeException("unreachable"); }
+        }
+    }
+
+    private static void selectMovesAlly() throws GameActionException {
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set facing = directions[ord] %}
+                {% set ordered_dirs = get_movements(facing) %}
+                {% for move_dir, is_wide_related in ordered_dirs %}
+                    moveAlly{{ dir_short_map[move_dir] }}();
+                    if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                    {% if move_dir == directions[ord] %}
+                        {% for dir in related_map[ord] %}
+                            {% for throw_dir in related_map[ord] %}
+                                tryThrowSecondaryAlly{{ dir_short_map[dir] }}{{ dir_short_map[throw_dir] }}();
+                                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                            {% endfor %}
+                        {% endfor %}
+                    {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { throw new RuntimeException("unreachable"); }
+        }
+    }
+
+    {% for move_dir in allDirections %}
+    private static void move{{ dir_short_map[move_dir] }}() throws GameActionException {
+        if (!CombatCommon.canMove{{dir_short_map[move_dir] }}) return;
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% for d in related_map[ord] %}
+                tryThrow{{ dir_short_map[move_dir] }}{{ dir_short_map[d] }}();
+                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+    {% endfor %}
+
+    {% for move_dir in allDirections %}
+    private static void moveAlly{{ dir_short_map[move_dir] }}() throws GameActionException {
+        if (!CombatCommon.canMove{{dir_short_map[move_dir] }}) return;
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% for d in related_map[ord] %}
+                tryThrowAlly{{ dir_short_map[move_dir] }}{{ dir_short_map[d] }}();
+                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+    {% endfor %}
+
+    private static void resetThrowGrid() {
+        {% for dy in range(grid_radius, -grid_radius - 1, -1) %}
+        {% for dx in range(-grid_radius, grid_radius + 1) %}
+        {{ occ_var(dx, dy) }} = null;
+        {% endfor %}
+        {% endfor %}
+    }
+
+    private static void markCell(int dx, int dy, RobotInfo info) {
+        switch (dx) {
+            {% for dx in range(-grid_radius, grid_radius + 1) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-grid_radius, grid_radius + 1) %}
+                    case {{ dy }} -> { {{ occ_var(dx, dy) }} = info; }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    private static RobotInfo getOccAt(int dx, int dy) {
+        switch (dx) {
+            {% for dx in range(-grid_radius, grid_radius + 1) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-grid_radius, grid_radius + 1) %}
+                    case {{ dy }} -> { return {{ occ_var(dx, dy) }}; }
+                    {% endfor %}
+                    default -> { return null; }
+                }
+            }
+            {% endfor %}
+            default -> { return null; }
+        }
+    }
+
+    private static void markKingZone(int dx, int dy, RobotInfo info) {
+        switch (dx) {
+            {% for dx in range(-grid_radius, grid_radius + 1) %}
+            case {{ dx }} -> {
+                switch (dy) {
+                    {% for dy in range(-grid_radius, grid_radius + 1) %}
+                    case {{ dy }} -> {
+                        {% for cx in range(-grid_radius, grid_radius + 1) %}
+                        {% for cy in range(-grid_radius, grid_radius + 1) %}
+                        {% if (cx - dx)|abs <= 1 and (cy - dy)|abs <= 1 %}
+                        {{ occ_var(cx, cy) }} = info;
+                        {% endif %}
+                        {% endfor %}
+                        {% endfor %}
+                    }
+                    {% endfor %}
+                    default -> { }
+                }
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    private static void populateThrowGrid() throws GameActionException {
+        for (int i = 0; i < RobotTracker.numEnemies; i++) {
+            RobotInfo info = RobotTracker.sortedEnemies[i];
+            int dx = info.location.x - myLocX;
+            int dy = info.location.y - myLocY;
+            if (dx < -{{ grid_radius }} || dx > {{ grid_radius }} || dy < -{{ grid_radius }} || dy > {{ grid_radius }}) continue;
+            if (info.getType() == UnitType.RAT_KING) {
+                markKingZone(dx, dy, info);
+            } else if (info.getType() == UnitType.BABY_RAT) {
+                markCell(dx, dy, info);
+            }
+        }
+        for (int i = 0; i < RobotTracker.numAllies; i++) {
+            RobotInfo info = RobotTracker.sortedAllies[i];
+            int dx = info.location.x - myLocX;
+            int dy = info.location.y - myLocY;
+            if (dx < -{{ grid_radius }} || dx > {{ grid_radius }} || dy < -{{ grid_radius }} || dy > {{ grid_radius }}) continue;
+            if (info.getType() == UnitType.RAT_KING) {
+                markKingZone(dx, dy, info);
+            } else if (info.getType() == UnitType.BABY_RAT) {
+                markCell(dx, dy, info);
+            }
+        }
+        if (GlobalArray.nearestRatKing != null) {
+            int dx = GlobalArray.nearestRatKing.x - myLocX;
+            int dy = GlobalArray.nearestRatKing.y - myLocY;
+            if (dx >= -{{ grid_radius }} && dx <= {{ grid_radius }} && dy >= -{{ grid_radius }} && dy <= {{ grid_radius }}) {
+                if (rc.canSenseLocation(GlobalArray.nearestRatKing)) {
+                    RobotInfo info = rc.senseRobotAtLocation(GlobalArray.nearestRatKing);
+                    if (info != null && info.getTeam() == team && info.getType() == UnitType.RAT_KING) {
+                        markKingZone(dx, dy, info);
+                    }
+                }
+            }
+        }
+    }
+
+    {% set debug = false %}
+
+    {% for move_dir in allDirections %}
+    {% for throw_dir in directions %}
+    private static void tryThrow{{ dir_short_map[move_dir] }}{{ dir_short_map[throw_dir] }}() throws GameActionException {
+        {% set base_dx = dir_dx[move_dir] + dir_dx[throw_dir] %}
+        {% set base_dy = dir_dy[move_dir] + dir_dy[throw_dir] %}
+        {% if debug %} // println("considered throwing {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        int moveCost = CombatCommon.movementCost({{ move_dir }}, {{ throw_dir }});
+        if (moveCost == -1) return;
+        MapLocation throwTarget = new MapLocation({{ coord_x(base_dx) }}, {{ coord_y(base_dy) }});
+        // can optimise statically
+        MapLocation newLoc = myLoc.add({{ move_dir }});
+        if (myLoc.distanceSquaredTo(throwTarget) <= 2 && rc.isMovementReady()) {
+            if (!CombatCommon.canMove(myLoc.directionTo(throwTarget))) return;
+        } else {
+            if (!rc.canSenseLocation(throwTarget)) return;
+            if ({{ occ_var(base_dx, base_dy) }} != null) return;
+            if (!rc.onTheMap(throwTarget)) return;
+            if (!rc.senseMapInfo(throwTarget).isPassable()) return;
+        }
+        {% if debug %} // println("verified {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        score = 0;
+        RobotInfo enemyHit = null;
+        scan: {
+            {% for rem in range(9, 5, -1) %}
+            {% set step = loop.index0 + 2 %}
+            {% set dx = dir_dx[move_dir] + step * dir_dx[throw_dir] %}
+            {% set dy = dir_dy[move_dir] + step * dir_dy[throw_dir] %}
+            {% set in_grid = (dx >= -grid_radius and dx <= grid_radius and dy >= -grid_radius and dy <= grid_radius) %}
+            {% if debug %} // println("scanning cell at dx=" + {{ dx }} + " dy=" + {{ dy }}); {% endif %}
+            if ({{ in_bounds_expr(dx, dy) }}) {
+                  c = CellTracker.mapData[{{ coord_y(dy) }}].charAt({{ coord_x(dx) }});
+                if (c == '\0') {
+                    {% if debug %} // println("havent seen this cell chief"); {% endif %}
+                    break scan;
+                }
+                if (c == '\2') {
+                    score += 10 + {{ rem * 4 }};
+                    break scan;
+                }
+            } else {
+                score += 10;
+                break scan; 
+            }
+            {% if debug %} // println("cell is passable"); {% endif %}
+            {% if in_grid %}
+            if ({{ occ_var(dx, dy) }} != null) {
+                {% if debug %} // println("occupied by " + {{ occ_var(dx, dy) }}); {% endif %}
+                if ({{ occ_var(dx, dy) }}.getTeam() == team) {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        score = -1000;
+                        break scan;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        score -= {{ rem * 4 }};
+                        break scan;
+                        {% else %}
+                        score -= {{ rem * 2 }};
+                        {% endif %}
+                    }
+                } else {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        score += 300;
+                        break scan;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        score += {{ 2 * (10 + 4 * rem) + 10 }};
+                        enemyHit = {{ occ_var(dx, dy) }};
+                        break scan;
+                        {% else %}
+                        score += {{ (10 + rem * 4) / (10 - rem) }};
+                        {% endif %}
+                    }
+                }
+            }
+            {% endif %}
+            if (CellTracker.isDirt({{ coord_x(dx) }}, {{ coord_y(dy) }})) {
+                {% if debug %} // println("cell is dirt"); {% endif %}
+                score += {{ rem * 4 }};
+                break scan;
+            }
+            {% endfor %}
+        }
+        if (enemyHit == null) {
+            score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }});
+        } else {
+            score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }}, enemyHit);
+        }
+        {% if debug %} // println("score for {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}: " + score); {% endif %}
+        {% if debug %} // println("enemy hit : " + enemyHit); {% endif %}
+        // if (score <= 0.1) return;
+        if (score > best) {
+            {% if debug %} // println("accepted throw {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }} with score " + score); {% endif %}
+            best = score;
+            md = {{ move_dir }};
+            td = {{ throw_dir }};
+            isSecondary = false;
+        }
+    }
+    {% endfor %}
+    {% endfor %}
+
+    public static boolean canSecondary(Direction moveDir, Direction throwDir) {
+        assert(moveDir != Direction.CENTER);
+        if (!rc.canTurn() && throwDir != myDir) return false;
+        if (!rc.isMovementReady() || !CombatCommon.canMove(moveDir)) return false;
+        return true;
+    }
+
+    {% for move_dir in allDirections %}
+    {% for throw_dir in directions %}
+    private static void tryThrowSecondary{{ dir_short_map[move_dir] }}{{ dir_short_map[throw_dir] }}() throws GameActionException {
+        {% set base_dx = dir_dx[throw_dir] %}
+        {% set base_dy = dir_dy[throw_dir] %}
+        {% if debug %} // println("considered throwing {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        MapLocation throwTarget = new MapLocation({{ coord_x(base_dx) }}, {{ coord_y(base_dy) }});
+        if (!rc.canSenseLocation(throwTarget)) return;
+        if (!canSecondary({{ move_dir }}, {{ throw_dir }})) return;
+        if ({{ occ_var(base_dx, base_dy) }} != null) return;
+        if (!rc.onTheMap(throwTarget)) return;
+        if (!rc.senseMapInfo(throwTarget).isPassable()) return;
+        {% if debug %} // println("verified {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        score = 0;
+        RobotInfo enemyHit = null;
+        scan: {
+            {% for rem in range(9, 5, -1) %}
+            {% set step = loop.index0 + 2 %}
+            {% set dx = step * dir_dx[throw_dir] %}
+            {% set dy = step * dir_dy[throw_dir] %}
+            {% set in_grid = (dx >= -grid_radius and dx <= grid_radius and dy >= -grid_radius and dy <= grid_radius) %}
+            {% if debug %} // println("scanning cell at dx=" + {{ dx }} + " dy=" + {{ dy }}); {% endif %}
+            if ({{ in_bounds_expr(dx, dy) }}) {
+                  c = CellTracker.mapData[{{ coord_y(dy) }}].charAt({{ coord_x(dx) }});
+                if (c == '\0') {
+                    {% if debug %} // println("havent seen this cell chief"); {% endif %}
+                    break scan;
+                }
+                if (c == '\2') {
+                    score += 10 + {{ rem * 4 }};
+                    break scan;
+                }
+            } else {
+                score += 10;
+                break scan; 
+            }
+            {% if debug %} // println("cell is passable"); {% endif %}
+            {% if in_grid %}
+            if ({{ occ_var(dx, dy) }} != null) {
+                {% if debug %} // println("occupied by " + {{ occ_var(dx, dy) }}); {% endif %}
+                if ({{ occ_var(dx, dy) }}.getTeam() == team) {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        score = -1000;
+                        break scan;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        score -= {{ rem * 4 }};
+                        break scan;
+                        {% else %}
+                        score -= {{ rem * 2 }};
+                        {% endif %}
+                    }
+                } else {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        score += 300;
+                        break scan;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        score += {{ 2 * (10 + 4 * rem) + 10 }};
+                        enemyHit = {{ occ_var(dx, dy) }};
+                        break scan;
+                        {% else %}
+                        score += {{ (10 + rem * 4) / (10 - rem) }};
+                        {% endif %}
+                    }
+                }
+            }
+            {% endif %}
+            if (CellTracker.isDirt({{ coord_x(dx) }}, {{ coord_y(dy) }})) {
+                {% if debug %} // println("cell is dirt"); {% endif %}
+                score += {{ rem * 4 }};
+                break scan;
+            }
+            {% endfor %}
+        }
+        if (enemyHit == null) {
+            score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }});
+        } else {
+            score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }}, enemyHit);
+        }
+        {% if debug %} // println("score for {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}: " + score); {% endif %}
+        {% if debug %} // println("enemy hit : " + enemyHit); {% endif %}
+        // if (score <= 0.1) return;
+        if (score > best) {
+            {% if debug %} // println("accepted throw {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }} with score " + score); {% endif %}
+            best = score;
+            md = {{ move_dir }};
+            td = {{ throw_dir }};
+            isSecondary = true;
+        }
+    }
+    {% endfor %}
+    {% endfor %}
+
+    // allies
+
+    {% for move_dir in allDirections %}
+    {% for throw_dir in directions %}
+    private static void tryThrowAlly{{ dir_short_map[move_dir] }}{{ dir_short_map[throw_dir] }}() throws GameActionException {
+        {% set base_dx = dir_dx[move_dir] + dir_dx[throw_dir] %}
+        {% set base_dy = dir_dy[move_dir] + dir_dy[throw_dir] %}
+        {% if debug %} println("considered throwing {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        int moveCost = CombatCommon.movementCost({{ move_dir }}, {{ throw_dir }});
+        if (moveCost == -1) return;
+        MapLocation throwTarget = new MapLocation({{ coord_x(base_dx) }}, {{ coord_y(base_dy) }});
+        // can optimise statically
+        MapLocation newLoc = myLoc.add({{ move_dir }});
+        if (myLoc.distanceSquaredTo(throwTarget) <= 2 && rc.isMovementReady()) {
+            if (!CombatCommon.canMove(myLoc.directionTo(throwTarget))) return;
+        } else {
+            if (!rc.canSenseLocation(throwTarget)) return;
+            if ({{ occ_var(base_dx, base_dy) }} != null) return;
+            if (!rc.onTheMap(throwTarget)) return;
+            if (!rc.senseMapInfo(throwTarget).isPassable()) return;
+        }
+        {% if debug %} println("verified {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        score = 0;
+        RobotInfo enemyHit = null;
+        scan: {
+            {% for rem in range(9, 8, -1) %}
+            {% set step = loop.index0 + 2 %}
+            {% set dx = dir_dx[move_dir] + step * dir_dx[throw_dir] %}
+            {% set dy = dir_dy[move_dir] + step * dir_dy[throw_dir] %}
+            {% set in_grid = (dx >= -grid_radius and dx <= grid_radius and dy >= -grid_radius and dy <= grid_radius) %}
+            {% if debug %} println("scanning cell at dx=" + {{ dx }} + " dy=" + {{ dy }}); {% endif %}
+            if ({{ in_bounds_expr(dx, dy) }}) {
+                  c = CellTracker.mapData[{{ coord_y(dy) }}].charAt({{ coord_x(dx) }});
+                if (c == '\0') {
+                    {% if debug %} println("havent seen this cell chief"); {% endif %}
+                    // break scan;
+                    return;
+                }
+                if (c == '\2') {
+                    // score += 10 + {{ rem * 4 }};
+                    // break scan;
+                    return;
+                }
+            } else {
+                // score += 10;
+                // break scan; 
+                return;
+            }
+            {% if debug %} println("cell is passable"); {% endif %}
+            {% if in_grid %}
+            if ({{ occ_var(dx, dy) }} != null) {
+                {% if debug %} println("occupied by " + {{ occ_var(dx, dy) }}); {% endif %}
+                if ({{ occ_var(dx, dy) }}.getTeam() == team) {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        // score = -1000;
+                        // break scan;
+                        return;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        // score -= {{ rem * 4 }};
+                        // break scan;
+                        {% else %}
+                        // score -= {{ rem * 2 }};
+                        {% endif %}
+                        return;
+                    }
+                } else {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        score += 300;
+                        break scan;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        score += {{ 2 * (10 + 4 * rem) + 10 }};
+                        enemyHit = {{ occ_var(dx, dy) }};
+                        break scan;
+                        {% else %}
+                        // score += {{ (10 + rem * 4) / (10 - rem) }};
+                        return;
+                        {% endif %}
+                    }
+                }
+            }
+            {% endif %}
+            if (CellTracker.isDirt({{ coord_x(dx) }}, {{ coord_y(dy) }})) {
+                {% if debug %} println("cell is dirt"); {% endif %}
+                // score += {{ rem * 4 }};
+                // break scan;
+                return;
+            }
+            {% endfor %}
+        }
+        if (enemyHit == null) {
+            // score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }});
+            return;
+        } else {
+            score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }}, enemyHit);
+        }
+        {% if debug %} println("score for {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}: " + score); {% endif %}
+        {% if debug %} println("enemy hit : " + enemyHit); {% endif %}
+        // if (score <= 0.1) return;
+        if (score > best) {
+            {% if debug %} println("accepted throw {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }} with score " + score); {% endif %}
+            best = score;
+            md = {{ move_dir }};
+            td = {{ throw_dir }};
+            isSecondary = false;
+        }
+    }
+    {% endfor %}
+    {% endfor %}
+
+    {% for move_dir in allDirections %}
+    {% for throw_dir in directions %}
+    private static void tryThrowSecondaryAlly{{ dir_short_map[move_dir] }}{{ dir_short_map[throw_dir] }}() throws GameActionException {
+        {% set base_dx = dir_dx[throw_dir] %}
+        {% set base_dy = dir_dy[throw_dir] %}
+        {% if debug %} println("considered throwing {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        MapLocation throwTarget = new MapLocation({{ coord_x(base_dx) }}, {{ coord_y(base_dy) }});
+        if (!rc.canSenseLocation(throwTarget)) return;
+        if (!canSecondary({{ move_dir }}, {{ throw_dir }})) return;
+        if ({{ occ_var(base_dx, base_dy) }} != null) return;
+        if (!rc.onTheMap(throwTarget)) return;
+        if (!rc.senseMapInfo(throwTarget).isPassable()) return;
+        {% if debug %} println("verified {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}"); {% endif %}
+        score = 0;
+        RobotInfo enemyHit = null;
+        scan: {
+            {% for rem in range(9, 8, -1) %}
+            {% set step = loop.index0 + 2 %}
+            {% set dx = step * dir_dx[throw_dir] %}
+            {% set dy = step * dir_dy[throw_dir] %}
+            {% set in_grid = (dx >= -grid_radius and dx <= grid_radius and dy >= -grid_radius and dy <= grid_radius) %}
+            {% if debug %} println("scanning cell at dx=" + {{ dx }} + " dy=" + {{ dy }}); {% endif %}
+            if ({{ in_bounds_expr(dx, dy) }}) {
+                  c = CellTracker.mapData[{{ coord_y(dy) }}].charAt({{ coord_x(dx) }});
+                if (c == '\0') {
+                    {% if debug %} println("havent seen this cell chief"); {% endif %}
+                    // break scan;
+                    return;
+                }
+                if (c == '\2') {
+                    // score += 10 + {{ rem * 4 }};
+                    // break scan;
+                    return;
+                }
+            } else {
+                // score += 10;
+                // break scan; 
+                return;
+            }
+            {% if debug %} println("cell is passable"); {% endif %}
+            {% if in_grid %}
+            if ({{ occ_var(dx, dy) }} != null) {
+                {% if debug %} println("occupied by " + {{ occ_var(dx, dy) }}); {% endif %}
+                if ({{ occ_var(dx, dy) }}.getTeam() == team) {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        // score = -1000;
+                        // break scan;
+                        return;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        // score -= {{ rem * 4 }};
+                        // break scan;
+                        {% else %}
+                        // score -= {{ rem * 2 }};
+                        {% endif %}
+                        return;
+                    }
+                } else {
+                    if ({{ occ_var(dx, dy) }}.getType() == UnitType.RAT_KING) {
+                        score += 300;
+                        break scan;
+                    } else {
+                        {% if loop.index0 == 0 %}
+                        score += {{ 2 * (10 + 4 * rem) + 10 }};
+                        enemyHit = {{ occ_var(dx, dy) }};
+                        break scan;
+                        {% else %}
+                        // score += {{ (10 + rem * 4) / (10 - rem) }};
+                        return;
+                        {% endif %}
+                    }
+                }
+            }
+            {% endif %}
+            if (CellTracker.isDirt({{ coord_x(dx) }}, {{ coord_y(dy) }})) {
+                {% if debug %} println("cell is dirt"); {% endif %}
+                // score += {{ rem * 4 }};
+                // break scan;
+                return;
+            }
+            {% endfor %}
+        }
+        if (enemyHit == null) {
+            // score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }});
+            return;
+        } else {
+            score += CombatStrategy.getCellScoreFor({{ move_dir }}, {{ throw_dir }}, enemyHit);
+        }
+        {% if debug %} println("score for {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }}: " + score); {% endif %}
+        {% if debug %} println("enemy hit : " + enemyHit); {% endif %}
+        // if (score <= 0.1) return;
+        if (score > best) {
+            {% if debug %} println("accepted throw {{ dir_short_map[move_dir] }} then {{ dir_short_map[throw_dir] }} with score " + score); {% endif %}
+            best = score;
+            md = {{ move_dir }};
+            td = {{ throw_dir }};
+            isSecondary = true;
+        }
+    }
+    {% endfor %}
+    {% endfor %}
+}

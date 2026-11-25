@@ -1,0 +1,3 @@
+# Older engine keys whose cached games this engine plays identically (tools/fishlib.py same_play_keys).
+# Add a key only when `tools/sameplay KEY` matched every replayed game; keep the keys already listed.
+a5c03b65bb22  # before the NEW init-call fix (127dbaf): 1200/1200 games same (b76cc4f vs jan29 and vs challenger)

@@ -1,0 +1,230 @@
+package awubot.robot.rat.combat.moves;
+
+import battlecode.common.Clock;
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+import battlecode.common.GameConstants;
+import battlecode.common.MapLocation;
+import battlecode.common.RobotInfo;
+import battlecode.common.UnitType;
+
+import awubot.robot.rat.combat.CombatCommon;
+import awubot.robot.rat.combat.CombatStrategy;
+import awubot.robot.rat.combat.CombatTracker;
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import static awubot.robot.rat.BabyRat.*;
+import awubot.RobotTracker;
+
+public final class TryRatNap {
+    private TryRatNap() {
+    }
+
+    static RobotInfo target;
+    static RobotInfo info;
+    static Direction bestMove;
+    static Direction bestFacing;
+    static Direction bestSecondaryMove;
+    static double bestScore;
+    static double score;
+    static Direction moveDir;
+    static MapLocation newLoc;
+    static int dxToTarget;
+    static int dyToTarget;
+    static double best;
+    static double weight;
+    static MapLocation t;
+    static int bytecodeStart, bytecodeBudget;
+
+    // return true if successfully ratnapped someone
+    // TODO: do danger levels and verify you dont die on the next turn
+    public static boolean run() throws GameActionException {
+        if (!rc.isActionReady()) return false;
+        bytecodeBudget = Math.min(3000, (int) (Clock.getBytecodesLeft() - 1000) / 2);
+        bytecodeStart = Clock.getBytecodeNum();
+        target = null;
+        bestMove = null;
+        bestFacing = null;
+        bestSecondaryMove = null;
+        bestScore = -1;
+        for (int i = 0; i < RobotTracker.numEnemies && i < 3; i++) {
+            if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) break;
+            info = RobotTracker.sortedEnemies[i];
+            t = info.location;
+            if (chebyshevDistance(myLoc, t) > 2) continue;
+            if (info.getHealth() <= GameConstants.RAT_BITE_DAMAGE) continue; // just kill
+            if (info.getType() != UnitType.BABY_RAT) continue;
+            // double weight = scoreEnemy(info);
+            weight = 30;
+            selectMoves();
+            if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) break;
+
+            if (i == 0) {
+                if(rc.getCurrentRatCost() >= 30) {
+                    for (int j = 0; j < RobotTracker.numAllies; j++) {
+                        info = RobotTracker.sortedAllies[j];
+                        t = info.location;
+                        if (chebyshevDistance(myLoc, t) > 2) continue;
+                        if (info.getHealth() > 22) continue;
+                        if (info.getType() != UnitType.BABY_RAT) continue;
+                        weight = 10;
+                        selectMoves();
+                        if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) break;
+                    }
+                }
+            }
+        }
+        if (bestScore < 0.5) return false;
+        // println("target " + t);
+        if (bestMove != null) {
+            if (!CombatStrategy.performMoves(bestMove, bestFacing)) {
+                // println(bestMove + " " + bestFacing);
+                assert(false);
+            }
+            if (rc.canCarryRat(target.location)) {
+                rc.carryRat(target.location);
+            } else {
+                attack(target);
+            }
+        } else {
+            if (rc.canCarryRat(target.location)) {
+                rc.carryRat(target.location);
+            } else {
+                attack(target);
+            }
+            assert(CombatStrategy.performMoves(bestSecondaryMove, bestFacing));
+        }
+        // println("!!!!!!!!!!!!!!!!!!!!!!! napped rat");
+        // indicate("COMBAT STRAT: NAP");
+        return true;
+    }
+
+    private static void selectMoves() throws GameActionException {
+        int dx = t.x - myLocX;
+        int dy = t.y - myLocY;
+        boolean canPerformSecondary = myLoc.distanceSquaredTo(t) <= 2 && (rc.getHealth() > info.getHealth() || !canSense(-dx, -dy, info.direction));
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set facing = directions[ord] %}
+                {% set ordered_dirs = get_movements(facing) %}
+                {% for move_dir, is_wide_related in ordered_dirs %}
+                    {% if is_wide_related %}
+                        move{{ dir_short_map[move_dir] }}();
+                        if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                    {% else %}
+                    if (canPerformSecondary) {
+                        {% for facing_dir in related_map[ord] %}
+                            considerSecondaryMove({{ move_dir }}, {{ facing_dir }});
+                            if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                        {% endfor %}
+                    }
+                    {% endif %}
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% for move_dir in allDirections %}
+    private static void move{{ dir_short_map[move_dir] }}() throws GameActionException {
+        if (!CombatCommon.canMove{{ dir_short_map[move_dir] }}) return;
+        moveDir = {{ move_dir }};
+        if (info.getTeam() == team && CombatTracker.hasAnyThreat(moveDir)) return;
+        newLoc = myLoc.add(moveDir);
+        dxToTarget = t.x - newLoc.x;
+        dyToTarget = t.y - newLoc.y;
+        if (dxToTarget * dxToTarget + dyToTarget * dyToTarget > 2) return;
+        if (info.getHealth() >= rc.getHealth() && canSense(-dxToTarget, -dyToTarget, info.direction)) return; // can i ratnap this guy
+        switch (newLoc.directionTo(t).ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% for facing in related_map[ord] %}
+                face{{ dir_short_map[facing] }}();
+                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% endfor %}
+    {% for face_dir in directions %}
+    private static void face{{ dir_short_map[face_dir] }}() throws GameActionException {
+        if (!canSense(dxToTarget, dyToTarget, {{ face_dir }})) return;
+        int moveCost = CombatCommon.movementCost(moveDir, {{ face_dir }});
+        if (moveCost == -1) return;
+        score = weight;
+        if (moveCost == 0) score -= CombatCommon.strafeCost();
+        score += CombatStrategy.getCellScoreFor(moveDir, {{ face_dir }}, info);
+        if (score <= 0.5) return;
+        if ({{ face_dir }} != myDir) {
+            score += 2; // prefer turning
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            target = info;
+            bestMove = moveDir;
+            bestFacing = {{ face_dir }};
+            bestSecondaryMove = null;
+        }
+    }
+
+    {% endfor %}
+
+    private static void considerSecondaryMove(Direction moveDir, Direction facing) throws GameActionException {
+        int moveCost = CombatCommon.movementCost(moveDir, facing);
+        if (moveCost == -1) return;
+        if (info.getTeam() == team && CombatTracker.hasAnyThreat(moveDir)) return;
+        double score = weight + 5;
+        if (moveCost == 0) score -= CombatCommon.strafeCost();
+        score += CombatStrategy.getCellScoreFor(moveDir, facing, info);
+        if (score <= 0.5) return;
+        if (facing != myDir) {
+            score += 2;
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            target = info;
+            bestMove = null;
+            bestFacing = facing;
+            bestSecondaryMove = moveDir;
+        }
+    }
+
+    public static boolean miniRun() throws GameActionException {
+        // first try to nap a rat looking at us
+        for (int i = 0; i < RobotTracker.numEnemies && i < 3; i++) {
+            info = RobotTracker.sortedEnemies[i];
+            if (info.getTeam() == team) continue;
+            if (info.location.distanceSquaredTo(myLoc) > 2) continue;
+            if (info.getHealth() <= CombatStrategy.getBiteDamage()) continue; // just kill
+            if (info.getType() != UnitType.BABY_RAT) continue;
+            int dx = info.location.x - myLocX;
+            int dy = info.location.y - myLocY;
+            if (canSense(dx, dy, info.direction)) {
+                if (rc.canCarryRat(info.location)) {
+                    rc.carryRat(info.location);
+                    // println("!!!!!!!!!!!!!!!!!!!!!!! mini napped rat");
+                    return true;
+                }
+            }
+        }
+        // nap anyone
+        for (int i = 0; i < RobotTracker.numEnemies && i < 3; i++) {
+            info = RobotTracker.sortedEnemies[i];
+            if (info.getTeam() == team) continue;
+            if (info.getHealth() <= CombatStrategy.getBiteDamage()) continue; // just kill
+            if (info.getType() != UnitType.BABY_RAT) continue;
+            if (rc.canCarryRat(info.location)) {
+                rc.carryRat(info.location);
+                // println("!!!!!!!!!!!!!!!!!!!!!!! mini napped rat");
+                // indicate("COMBAT STRAT: MINI NAP");
+                return true;
+            }
+        }
+        return false;
+    }
+}

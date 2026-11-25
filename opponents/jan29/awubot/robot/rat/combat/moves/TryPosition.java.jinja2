@@ -1,0 +1,96 @@
+package awubot.robot.rat.combat.moves;
+
+import battlecode.common.Clock;
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+import battlecode.common.GameConstants;
+import battlecode.common.MapLocation;
+import battlecode.common.RobotInfo;
+import battlecode.common.UnitType;
+
+import awubot.robot.rat.combat.CombatCommon;
+import awubot.robot.rat.combat.CombatStrategy;
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import static awubot.robot.rat.BabyRat.*;
+import awubot.RobotTracker;
+
+public final class TryPosition {
+    private TryPosition() {
+    }
+
+    static Direction bestMove;
+    static Direction bestFacing;
+    static double bestScore;
+    static Direction moveDir;
+    static MapLocation newLoc;
+    static double score;
+    static int bytecodeStart, bytecodeBudget;
+
+    public static boolean run() throws GameActionException {
+        if (!rc.isMovementReady()) return false;
+        bytecodeStart = Clock.getBytecodeNum();
+        bytecodeBudget = Math.min(3000, Clock.getBytecodesLeft() - 1000);
+        // // Profiler.push();
+        bestMove = null;
+        bestFacing = null;
+        bestScore = -1e9;
+        selectMoves();
+        assert(CombatStrategy.performMoves(bestMove, bestFacing));// indicate
+        return true;
+    }
+
+    private static void selectMoves() throws GameActionException {
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set facing = directions[ord] %}
+                {% set ordered_dirs = get_movements(facing) %}
+                {% for move_dir, is_wide_related in ordered_dirs %}
+                move{{ dir_short_map[move_dir] }}();
+                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% for move_dir in allDirections %}
+    private static void move{{ dir_short_map[move_dir] }}() throws GameActionException {
+        if (!CombatCommon.canMove{{dir_short_map[move_dir] }}) return;
+        moveDir = {{ move_dir }};
+        newLoc = myLoc.add({{ move_dir }});
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% for f in related_map[ord] %}
+                face{{ dir_short_map[f] }}();
+                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+    {% endfor %}
+
+    {% for face_dir in directions %}
+    private static void face{{ dir_short_map[face_dir] }}() throws GameActionException {
+        int moveCost = CombatCommon.movementCost(moveDir, {{ face_dir }});
+        if (moveCost == -1) return;
+        score = 0;
+        if (moveCost == 1) score += 10;
+        if (moveDir != Direction.CENTER) score += 5;
+        score += CombatStrategy.getCellScoreFor(moveDir, {{ face_dir }});
+        if ({{ face_dir }} != myDir) {
+            score += 2;
+        }
+        if (score > bestScore) {
+            bestScore = score;
+            bestMove = moveDir;
+            bestFacing = {{ face_dir }};
+        }
+    }
+    {% endfor %}
+}

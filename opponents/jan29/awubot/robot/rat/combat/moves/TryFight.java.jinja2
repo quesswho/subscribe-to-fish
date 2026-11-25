@@ -1,0 +1,160 @@
+package awubot.robot.rat.combat.moves;
+
+import battlecode.common.Clock;
+import battlecode.common.Direction;
+import battlecode.common.GameActionException;
+import battlecode.common.MapLocation;
+import battlecode.common.RobotInfo;
+
+import awubot.robot.rat.combat.CombatCommon;
+import awubot.robot.rat.combat.CombatStrategy;
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import static awubot.robot.rat.BabyRat.*;
+import awubot.RobotTracker;
+import awubot.comms.Enemy;
+
+public final class TryFight {
+    private TryFight() {
+    }
+
+    static Direction md;
+    static Direction fd;
+    static double best;
+    static Direction moveDir;
+    static MapLocation newLoc;
+    static double score;
+    static boolean facingTarget;
+    static Enemy target;
+    static int dxToTarget;
+    static int dyToTarget;
+    static int bytecodeStart, bytecodeBudget;
+    static boolean isCat;
+    static int catFightCooldown = -1;
+    static int curCatDist;
+
+    public static boolean run() throws GameActionException {
+        // // Profiler.push();
+        md = null;
+        fd = null;
+        isCat = false;
+        best = -1e9;
+        if (RobotTracker.numEnemies > 0) {
+            target = new Enemy(RobotTracker.sortedEnemies[0]);
+        } else if (RobotTracker.numCats > 0) {
+            if (time - catFightCooldown < 10) {
+                return false;
+            }
+            target = new Enemy(RobotTracker.sortedCats[0]);
+            curCatDist = catDist(myLoc);
+            isCat = true;
+        } else if (CombatStrategy.funnyTarget != null) {
+            target = CombatStrategy.funnyTarget;
+        } else {
+            // println("wtf ?????????????????????????????????????????????????????????");
+            assert(false);
+            return false;
+        }
+        bytecodeStart = Clock.getBytecodeNum();
+        bytecodeBudget = Clock.getBytecodesLeft() - 1500;
+        selectMoves();
+        if (isCat) {
+            if (md == null) {
+                catFightCooldown = time;
+                return false;
+            }
+        }
+        // // Profiler.pop("try fight");
+        // force this strategy
+        // if (md == null) return false;
+        CombatStrategy.performMoves(md, fd);
+        TryAttack.miniRun();
+        // indicate("COMBAT STRAT: FIGHT");
+        // try to squeeze some juice out
+        return true;
+    }
+
+    private static void selectMoves() throws GameActionException {
+        switch (myDir.ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% set facing = directions[ord] %}
+                {% set ordered_dirs = get_movements(facing) %}
+                {% for move_dir, is_wide_related in ordered_dirs %}
+                    move{{ dir_short_map[move_dir] }}();
+                    if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% for move_dir in allDirections %}
+    private static void move{{ dir_short_map[move_dir] }}() throws GameActionException {
+        {% if move_dir != "Direction.CENTER" %}
+        if (!rc.isMovementReady()) return;
+        {% endif %}
+        if (!CombatCommon.canMove{{ dir_short_map[move_dir] }}) return;
+        moveDir = {{ move_dir }};
+        newLoc = myLoc.add(moveDir);
+        if (isCat) {
+            if (catDist(newLoc) >= curCatDist) {
+                return;
+            }
+        }
+        dxToTarget = target.location.x - newLoc.x;
+        dyToTarget = target.location.y - newLoc.y;
+        if (isCat) {
+            if (canCatSense(-dxToTarget, -dyToTarget, target.direction)) {
+                return; 
+            }
+        }
+        switch (newLoc.directionTo(target.location).ordinal()) {
+            {% for ord in range(8) %}
+            case {{ ord }} -> {
+                {% for facing in related_map[ord] %}
+                face{{ dir_short_map[facing] }}();
+                if (Clock.getBytecodeNum() - bytecodeStart > bytecodeBudget) return;
+                {% endfor %}
+            }
+            {% endfor %}
+            default -> { }
+        }
+    }
+
+    {% endfor %}
+    {% for face_dir in directions %}
+    private static void face{{ dir_short_map[face_dir] }}() throws GameActionException {
+        int moveCost = CombatCommon.movementCost(moveDir, {{ face_dir }});
+        if (moveCost == -1) return;
+        score = CombatStrategy.getCellScoreFor(moveDir, {{ face_dir }});
+        if (moveCost == 1) score += 10;
+        facingTarget = canSense(dxToTarget, dyToTarget, {{ face_dir }});
+        if (!facingTarget) {
+            score -= 5;
+        }
+        if ((CombatStrategy.moveMask & (1 << moveDir.ordinal())) != 0) {
+            score += 30;
+        }
+        if ({{ face_dir }} != myDir) {
+            // prefer turning
+            score += 2;
+        }
+        if (score > best) {
+            best = score;
+            md = moveDir;
+            fd = {{ face_dir }};
+        }
+    }
+
+    {% endfor %}
+
+    private static int catDist(MapLocation loc) {
+        int catX = 2 * target.location.x + 1;
+        int catY = 2 * target.location.y + 1;
+        int dx = catX - 2 * loc.x;
+        int dy = catY - 2 * loc.y;
+        return dx * dx + dy * dy;
+    }
+}

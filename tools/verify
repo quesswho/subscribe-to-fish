@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Checks that fish plays exactly like the official engine.
+
+Plays each (map, seed) on both engines with the same bots and compares the state hash after every round. The first
+round that differs is dumped from both sides so the cause can be found.
+
+  tools/verify                                  every map in maps/, seed 0, the working tree's bot against itself
+  tools/verify --maps DefaultSmall,rift --seeds 0,1,2
+  tools/verify --a wt --b HEAD~2               any bots: 'wt', a git ref, or a folder of compiled classes
+  tools/verify --maps testmaps/gen --jobs 4     a folder of maps
+
+Exit 0 when every game matched.
+"""
+import argparse
+import concurrent.futures
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+from fishlib import ROOT, JAVA, JAVA_OPENS, engine_classpath  # noqa: E402
+
+
+def ref_cmd(map_file, a, b, seed, dump=None):
+    cp = f"{ROOT / 'engine/build/ref'}:{engine_classpath()}"
+    cmd = [JAVA, *JAVA_OPENS, "-Xmx2g", "-cp", cp, "fishref.RefTrace", str(map_file), a, b, str(seed)]
+    return cmd + ([str(dump)] if dump is not None else [])
+
+
+def fish_cmd(map_file, a, b, seed, dump=None):
+    cmd = [str(ROOT / "engine/build/fish"), "run", str(map_file), "--a", a, "--b", b, "--seed", str(seed), "--trace"]
+    return cmd + (["--dump", str(dump)] if dump is not None else [])
+
+
+def run(cmd):
+    with F.slot():
+        p = subprocess.run(cmd, capture_output=True, text=True, env=F.fish_env())
+    trace = [l for l in p.stderr.splitlines() if l.startswith("R ")]
+    return trace, p.stdout.strip().splitlines()[-1:] or [p.stderr.strip()[-500:]], p.stderr
+
+
+def dump_round(cmd_fn, map_file, a, b, seed, rnd):
+    _, _, err = run(cmd_fn(map_file, a, b, seed, rnd))
+    lines = err.splitlines()
+    out, on = [], False
+    for l in lines:
+        if l.startswith("R "):
+            on = l.split()[1] == str(rnd)
+            continue
+        if on and l.startswith("  "):
+            out.append(l)
+    return out
+
+
+def check(map_file, seed, a, b):
+    map_name = map_file.stem
+    with concurrent.futures.ThreadPoolExecutor(2) as ex:
+        ref_f = ex.submit(run, ref_cmd(map_file, a, b, seed))
+        fish_f = ex.submit(run, fish_cmd(map_file, a, b, seed))
+        (ref, ref_res, ref_err), (fish, fish_res, fish_err) = ref_f.result(), fish_f.result()
+    first = None
+    for i in range(max(len(ref), len(fish))):
+        if i >= len(ref) or i >= len(fish) or ref[i] != fish[i]:
+            first = i + 1
+            break
+    if first is None:
+        return True, f"ok   {map_name} seed {seed}: {len(ref)} rounds  ref {ref_res[0]}  fish {fish_res[0]}"
+    msg = [f"DIFF {map_name} seed {seed}: first difference after round {first} "
+           f"(ref {len(ref)} rounds, fish {len(fish)})", f"  ref  {ref_res[0]}", f"  fish {fish_res[0]}"]
+    if not ref:
+        msg.append("  ref stderr: " + ref_err[-2000:])
+    if not fish:
+        msg.append("  fish stderr: " + fish_err[-2000:])
+    if ref and fish:
+        rd = dump_round(ref_cmd, map_file, a, b, seed, first)
+        fd = dump_round(fish_cmd, map_file, a, b, seed, first)
+        rd_set, fd_set = set(rd), set(fd)
+        msg += ["  only in ref:"] + ["   " + l for l in rd if l not in fd_set]
+        msg += ["  only in fish:"] + ["   " + l for l in fd if l not in rd_set]
+    return False, "\n".join(msg)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--maps", help="comma separated map names (default: all of maps/)")
+    ap.add_argument("--seeds", default="0")
+    ap.add_argument("--a", default="wt")
+    ap.add_argument("--b", default="wt")
+    ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 4))
+    args = ap.parse_args()
+    F.build_engine()
+    a, b = F.build_bot(args.a).spec, F.build_bot(args.b).spec
+    maps = F.resolve_maps(args.maps or "pool")
+    seeds = [int(s) for s in args.seeds.split(",")]
+    games = [(m, s) for m in maps for s in seeds]
+    bad = 0
+    with concurrent.futures.ThreadPoolExecutor(args.jobs) as ex:
+        for ok, text in ex.map(lambda g: check(g[0], g[1], a, b), games):
+            print(text, flush=True)
+            bad += not ok
+    print(f"{len(games) - bad}/{len(games)} games identical")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

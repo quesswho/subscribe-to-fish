@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Builds the fish engine (engine/build/fish), its Java host, the reference tracer, and the working tree's bot.
+
+  tools/build            engine + bot
+  tools/build --clean    from scratch
+
+Needs a JDK 21 at ~/.cache/caterpillow/jdk21 (or FISH_JDK); `tools/setup` downloads one.
+"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import fishlib as F  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--clean", action="store_true")
+    args = ap.parse_args()
+    if not Path(F.JAVAC).exists():
+        F.die(f"no JDK at {F.JDK}: run tools/setup or set FISH_JDK")
+    if args.clean:
+        shutil.rmtree(F.ROOT / "engine/build", ignore_errors=True)
+    env = dict(os.environ, JAVA_HOME=str(F.JDK))
+    subprocess.run([str(F.ROOT / "gradlew"), "engineClasspath", "-q", "--console=plain"], cwd=F.ROOT, env=env,
+                   check=True)
+    F.build_engine(quiet=False)
+    bot = F.build_bot("wt")
+    print(f"engine: {F.FISH}\nbot:    {bot.classes} ({bot.key})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

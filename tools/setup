@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Downloads a Temurin JDK 21 into ~/.cache/caterpillow/jdk21 (the official engine runs on Java 21, and the
+# instrumented JDK classes, so bytecode counts, depend on that version), then builds everything.
+set -euo pipefail
+dest="${FISH_JDK:-$HOME/.cache/caterpillow/jdk21}"
+if [ ! -x "$dest/bin/javac" ]; then
+  tmp="$(mktemp -d)"
+  echo "downloading JDK 21 to $dest"
+  curl -fsSL -o "$tmp/jdk.tar.gz" "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse"
+  mkdir -p "$tmp/x" && tar xzf "$tmp/jdk.tar.gz" -C "$tmp/x"
+  mkdir -p "$(dirname "$dest")" && rm -rf "$dest" && mv "$tmp"/x/* "$dest"
+  rm -rf "$tmp"
+fi
+exec "$(dirname "$0")/build"

@@ -1,0 +1,126 @@
+package awubot.robot.rat.goHome;
+
+import battlecode.common.*;
+import awubot.Pathfinder;
+import awubot.comms.GlobalArray;
+import awubot.robot.Strategy;
+import awubot.Pathfinder;
+import awubot.util.Profiler;
+import awubot.robot.rat.BabyRat;
+import awubot.robot.rat.TraverseStrategy;
+
+import static awubot.Game.*;
+import static awubot.util.Util.*;
+import static awubot.robot.rat.BabyRat.*;
+
+public class GoHomeStrategy extends Strategy {
+    private int king;
+
+    public GoHomeStrategy() {
+        king = GlobalArray.nearestRatKingId;
+    }
+
+    @Override
+    public boolean runTick() throws GameActionException {
+        if(rc.getRawCheese() == 0) return false;
+        // indicate("going home");
+
+        {% macro tryTurnAndTransfer() %}
+        if(rc.getRawCheese() != 0 && rc.canTurn()) {
+            var nearestKingLoc = GlobalArray.nearestRatKing;
+            int dx = Integer.compare(myLoc.x, nearestKingLoc.x);
+            int dy = Integer.compare(myLoc.y, nearestKingLoc.y);
+            var transferTarget = new MapLocation(nearestKingLoc.x + dx, nearestKingLoc.y + dy);
+            if(transferTarget.distanceSquaredTo(myLoc) <= 9) {
+                turn(myLoc.directionTo(transferTarget));
+                return false;
+            }
+        }
+        {% endmacro %}
+        {{ tryTurnAndTransfer() }}
+
+        var kingLoc = GlobalArray.getRatKing(king);
+
+        if (kingLoc == null) {
+            // king died, try to find another king
+            king = GlobalArray.nearestRatKingId;
+            kingLoc = GlobalArray.nearestRatKing;
+            if (kingLoc == null) return false;
+        }
+
+        if(rc.isMovementReady()) {
+            Pathfinder.computeReachable();
+            // Profiler.begin();
+            var g = AntColony.mark[king];
+            char best = '\uFFFF';
+            int bestX = -1, bestY = -1;
+            var x = myLocX - 5;
+            var y = myLocY - 5;
+            // System.out.println("start " + x + " " + y);
+            {% set ns = namespace(off=0) %}
+            {% for i in range(11) %}
+            {
+                if(y >= 0 && y < mapHeight) {
+                    var row = g[y];
+                    {% for j in range(11) %}
+                    {% if ns.off != 60 %}
+                    {
+                        if(x >= 0 && x < mapWidth &&
+                           {% if ns.off < 61 %}
+                           (Pathfinder.reach0 & (1l << {{ns.off}}))
+                           {% else %}
+                           (Pathfinder.reach1 & (1l << {{ns.off - 61}}))
+                           {% endif %}
+                           != 0
+                           ) {
+                            var v = row.charAt(x);
+                            if(v < best) {
+                                best = v;
+                                bestX = x;
+                                bestY = y;
+                            }
+                        }
+                    }
+                    {% endif %}
+                    {% if j < 10 %}
+                    {% if i % 2 == 0 %}
+                    x++;
+                    {% set ns.off = ns.off + 1 %}
+                    {% else %}
+                    x--;
+                    {% set ns.off = ns.off - 1 %}
+                    {% endif %}
+                    {% elif i < 10 %}
+                    y++;
+                    {% set ns.off = ns.off + 11 %}
+                    {% endif %}
+                    {% endfor %}
+                } else {
+                    y++;
+                    {% if i % 2 == 0 %}
+                    x += 10;
+                    {% else %}
+                    x -= 10;
+                    {% endif %}
+                }
+            }
+            {% endfor %}
+            // Profiler.end("rmq");
+
+            // indicate("best " + (int)best);
+            if(best == '\uFFFF') {
+                var traverseStrategy = new TraverseStrategy(kingLoc, 8);
+                traverseStrategy.runTick();
+            } else {
+                var bestLoc = new MapLocation(bestX, bestY);
+                BabyRat.autoMove(Pathfinder.doBfs(bestLoc));
+                // indicate("bestLoc = " + bestLoc);
+                // rc.setIndicatorLine(myLoc, bestLoc, 0, 0, 255);
+            }
+            {{ tryTurnAndTransfer() }}
+        }
+
+        // rc.setIndicatorLine(myLoc, kingLoc, 0, 255, 0);
+        return true;
+    }
+}
